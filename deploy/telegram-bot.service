@@ -5,9 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=bot
-WorkingDirectory=/home/bot/TelegramAutoTradeBot
-ExecStart=/home/bot/TelegramAutoTradeBot/.venv/bin/python main.py
+WorkingDirectory=/opt/TelegramAutoTradeBot
+ExecStart=/opt/TelegramAutoTradeBot/.venv/bin/python main.py
 Restart=on-failure
 RestartSec=15
 
