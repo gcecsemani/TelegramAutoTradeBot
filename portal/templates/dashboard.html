@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Accounts{% endblock %}
+{% block body %}
+<div class="page-head">
+  <div>
+    <h1>Accounts</h1>
+    {% if live_trading %}
+      <p class="lede bad">Server live switch is on. Accounts marked live will send real orders.</p>
+    {% else %}
+      <p class="lede">Server live switch is off. Linked accounts can rehearse on paper. Set <code>LIVE_TRADING=1</code> in the server env file only when you want real orders.</p>
+    {% endif %}
+    {% if user.role == 'admin' %}
+      <p class="lede">Admin view: every account on this server. Each other person only sees the accounts they linked.</p>
+    {% endif %}
+  </div>
+  <a class="button" href="/accounts/new">Link a broker</a>
+</div>
+{% for account in accounts %}
+<article class="card account">
+  <div>
+    <div class="identity">
+      <h2>{{ account.label }}</h2>
+      {% if user.role == 'admin' %}<span class="muted">{{ account.owner_email }}</span>{% endif %}
+      <span class="pill {{ account.mode }}">{{ account.mode }}</span>
+      <span class="muted">{{ account.broker_label }}</span>
+      {% if account.kill_switch %}<span class="pill live">kill switch</span>{% endif %}
+    </div>
+    <p class="note {{ 'ok' if not account.block else 'warn' }}">
+      {% if account.block %}Cannot buy: {{ account.block }}{% else %}Ready to copy buys{% endif %}
+    </p>
+    <div class="actions">
+      <a class="button ghost" href="/accounts/{{ account.id }}">Settings</a>
+      {% if account.broker == 'zerodha' %}
+        <a class="button ghost" href="/accounts/{{ account.id }}/auth">Daily login</a>
+      {% endif %}
+    </div>
+  </div>
+  <div class="pnl">
+    <span class="kicker">Today</span>
+    <strong class="{{ 'ok' if account.day_pnl >= 0 else 'bad' }}">₹{{ '{:,.0f}'.format(account.day_pnl) }}</strong>
+  </div>
+</article>
+{% else %}
+<section class="card">
+  <h2>No brokers linked yet</h2>
+  <p class="lede">Add a Zerodha key to rehearse copies. The account stays on paper until you arm it.</p>
+</section>
+{% endfor %}
+{% endblock %}

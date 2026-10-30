@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Daily login{% endblock %}
+{% block body %}
+<section class="card narrow">
+  <p class="kicker">{{ account.broker_label }}</p>
+  <h1>Daily login</h1>
+  <p class="lede">{{ account.label }}</p>
+  {% if account.broker != 'zerodha' %}
+    <p>{{ account.broker_label }} cannot renew a token yet. The key is saved for when that broker is connected.</p>
+  {% else %}
+    <p>Zerodha access tokens die every morning. Open the login link, sign in, and paste the full redirect URL from the address bar. The page at <code>127.0.0.1</code> does not need to load.</p>
+    {% if login_url %}
+      <p><a class="button" href="{{ login_url }}" target="_blank" rel="noreferrer">Open Zerodha login</a></p>
+      <p class="url muted">{{ login_url }}</p>
+    {% endif %}
+    <form method="post" action="/accounts/{{ account.id }}/auth">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <div class="field">
+        <label for="request_token">Redirect URL or request token</label>
+        <input id="request_token" name="request_token" autocomplete="off" required>
+      </div>
+      <p class="form-actions"><button type="submit">Save today's token</button></p>
+    </form>
+    <p class="{{ 'ok' if account.token_today else 'warn' }}">
+      {% if account.token_today %}Token on file is from today ({{ account.token_date }}).{% else %}No token for today yet.{% endif %}
+    </p>
+  {% endif %}
+</section>
+{% endblock %}

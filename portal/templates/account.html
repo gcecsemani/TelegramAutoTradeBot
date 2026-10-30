@@ -1,0 +1,143 @@
+{% extends "base.html" %}
+{% block title %}{{ account.label }}{% endblock %}
+{% block body %}
+<section class="card">
+  <div class="identity">
+    <h1>{{ account.label }}</h1>
+    <span class="pill {{ account.mode }}">{{ account.mode }}</span>
+    {% if account.kill_switch %}<span class="pill live">kill switch</span>{% endif %}
+  </div>
+  <p class="{{ 'ok' if not account.block else 'warn' }}">
+    {% if account.block %}Cannot buy: {{ account.block }}{% else %}Ready to copy buys{% endif %}
+    {% if account.broker == 'zerodha' %} · <a href="/accounts/{{ account.id }}/auth">Daily Zerodha login</a>{% endif %}
+  </p>
+  <div class="actions">
+    <form method="post" action="/accounts/{{ account.id }}/kill">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      {% if account.kill_switch %}
+        <input type="hidden" name="action" value="off">
+        <button class="ghost" type="submit">Clear kill switch</button>
+      {% else %}
+        <input type="hidden" name="action" value="on">
+        <button class="danger" type="submit">Kill switch</button>
+      {% endif %}
+    </form>
+    <form method="post" action="/accounts/{{ account.id }}/flatten" onsubmit="return confirm('Sell every open leg on this account?');">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button class="danger" type="submit">Flatten</button>
+    </form>
+    <form method="post" action="/accounts/{{ account.id }}/delete" onsubmit="return confirm('Remove this account from copying? This cannot be undone.');">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button class="danger" type="submit">Remove account</button>
+    </form>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Broker and limits</h2>
+  <form method="post" action="/accounts/{{ account.id }}">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <div class="grid" style="margin-top: 16px">
+      <div class="field">
+        <label for="label">Label</label>
+        <input id="label" name="label" value="{{ account.label }}" required>
+      </div>
+      <div class="field">
+        <label for="broker">Broker</label>
+        <select id="broker" name="broker">
+          {% for key, cfg in brokers.items() %}
+            <option value="{{ key }}" {% if account.broker == key %}selected{% endif %}>{{ cfg.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <label for="client_id">Client id</label>
+        <input id="client_id" name="client_id" value="{{ account.client_id }}">
+      </div>
+      <div class="field">
+        <label for="product">Product</label>
+        <select id="product" name="product">
+          <option value="MIS" {% if account.product == 'MIS' %}selected{% endif %}>MIS (intraday)</option>
+          <option value="NRML" {% if account.product == 'NRML' %}selected{% endif %}>NRML (carry)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="api_key">API key {% if account.has_key %}(saved, leave blank to keep){% endif %}</label>
+        <input id="api_key" name="api_key" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="api_secret">API secret {% if account.has_secret %}(saved, leave blank to keep){% endif %}</label>
+        <input id="api_secret" name="api_secret" type="password" autocomplete="new-password">
+      </div>
+      <div class="field">
+        <label for="max_loss_trade">Max loss per trade (₹, blank = no cap)</label>
+        <input id="max_loss_trade" name="max_loss_trade" inputmode="decimal" value="{{ account.max_loss_trade if account.max_loss_trade is not none else '' }}">
+      </div>
+      <div class="field">
+        <label for="max_loss_day">Max loss per day (₹, blank = no cap)</label>
+        <input id="max_loss_day" name="max_loss_day" inputmode="decimal" value="{{ account.max_loss_day if account.max_loss_day is not none else '' }}">
+      </div>
+    </div>
+    <div class="checks">
+      <label class="check"><input type="checkbox" name="enabled" value="1" {% if account.enabled %}checked{% endif %}> Enabled for copy</label>
+      <label class="check"><input type="checkbox" name="auto_kill" value="1" {% if account.auto_kill %}checked{% endif %}> Auto kill switch when the day's loss limit is hit</label>
+      <label class="check"><input type="checkbox" name="flatten_on_kill" value="1" {% if account.flatten_on_kill %}checked{% endif %}> Also flatten open legs when that happens</label>
+    </div>
+    <div class="modes">
+      <label class="mode"><input type="radio" name="mode" value="paper" {% if account.mode != 'live' %}checked{% endif %}> <span><strong>Paper</strong><small>Rehearse the copy</small></span></label>
+      <label class="mode"><input type="radio" name="mode" value="live" {% if account.mode == 'live' %}checked{% endif %}> <span><strong>Live</strong><small>Send real orders</small></span></label>
+    </div>
+    <label class="check"><input type="checkbox" name="confirm_live" value="1"> I understand live mode sends real orders when the server switch is on</label>
+    {% if not live_trading %}<p class="muted">LIVE_TRADING is off. You can save live mode, but buys stay skipped until that switch is on. Paper mode still rehearses fills.</p>{% endif %}
+    <p class="form-actions"><button type="submit">Save</button></p>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Lots and slippage per symbol</h2>
+  <p class="lede"><code>*</code> is the default. A named symbol (NIFTY, SENSEX, CRUDEOIL) replaces it for that name. Buys are limit orders capped by this slippage. Exits are market orders.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Symbol</th><th class="num">Lots</th><th class="num">Min</th><th class="num">Max</th><th>Slippage</th><th></th></tr></thead>
+      <tbody>
+        {% for rule in rules %}
+        <tr>
+          <td>{{ rule.symbol }}</td>
+          <td class="num">{{ rule.lots }}</td>
+          <td class="num">{{ rule.min_lots }}</td>
+          <td class="num">{{ rule.max_lots }}</td>
+          <td>{{ rule.slippage_value }} {{ rule.slippage_mode|lower }}</td>
+          <td>
+            {% if rule.symbol != '*' %}
+            <form method="post" action="/accounts/{{ account.id }}/rules/delete">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <input type="hidden" name="symbol" value="{{ rule.symbol }}">
+              <button class="ghost" type="submit">Remove</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <form class="rule-form" method="post" action="/accounts/{{ account.id }}/rules">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <div class="grid">
+      <div class="field"><label for="symbol">Symbol</label><input id="symbol" name="symbol" value="*" required></div>
+      <div class="field"><label for="lots">Lots</label><input id="lots" name="lots" value="2" required></div>
+      <div class="field"><label for="min_lots">Min</label><input id="min_lots" name="min_lots" value="1" required></div>
+      <div class="field"><label for="max_lots">Max</label><input id="max_lots" name="max_lots" value="2" required></div>
+      <div class="field">
+        <label for="slippage_mode">Slippage</label>
+        <select id="slippage_mode" name="slippage_mode">
+          <option value="PERCENT">Percent</option>
+          <option value="POINTS">Points</option>
+        </select>
+      </div>
+      <div class="field"><label for="slippage_value">Slippage value</label><input id="slippage_value" name="slippage_value" value="2.5" required></div>
+    </div>
+    <p class="form-actions"><button type="submit">Save symbol rule</button></p>
+  </form>
+</section>
+{% endblock %}

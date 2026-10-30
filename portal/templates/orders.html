@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Orders{% endblock %}
+{% block body %}
+<div class="page-head">
+  <div>
+    <h1>Copy orders</h1>
+    <p class="lede">One row is claimed before the broker is called. A retry uses the same row, so it cannot double-fill.</p>
+  </div>
+</div>
+<section class="card">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>When</th><th>Account</th><th>Contract</th><th>Side</th><th class="num">Lots</th><th>Status</th><th>Detail</th></tr>
+      </thead>
+      <tbody>
+        {% for order in orders %}
+        <tr>
+          <td>{{ order.created_at[11:16] }}</td>
+          <td>{{ order.account_label }}<br><span class="muted">{{ order.mode }}{% if user.role == 'admin' %} · {{ order.owner_email }}{% endif %}</span></td>
+          <td>{{ order.tradingsymbol }}</td>
+          <td class="side {{ order.action|lower }}">{{ order.action }}</td>
+          <td class="num">{{ order.lots }}</td>
+          <td><span class="status {{ order.status|lower }}">{{ order.status }}</span></td>
+          <td>{{ order.reason or order.last_error }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7">No copy orders yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

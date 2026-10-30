@@ -91,6 +91,11 @@ class FakeTelegram:
 class Harness(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
+        os.environ["PORTAL_DB"] = os.path.join(self.tmp, "portal.db")
+        config.ZERODHA_API_KEY = config.ZERODHA_API_KEY or "test"
+        config.TELEGRAM_BOT_TOKEN = config.TELEGRAM_BOT_TOKEN or "test"
+        config.TELEGRAM_SIGNAL_CHAT_ID = config.TELEGRAM_SIGNAL_CHAT_ID or "1"
+        config.TELEGRAM_UPDATE_CHAT_ID = config.TELEGRAM_UPDATE_CHAT_ID or "2"
         self._paths = dict(config.PATHS)
         for key in ("positions", "telegram_offset", "trade_journal", "ledger_daily", "ledger_monthly"):
             config.PATHS[key] = os.path.join(self.tmp, os.path.basename(config.PATHS[key]))
@@ -239,7 +244,7 @@ class EntryTests(Harness):
         self.post("NIFTY 22825PE\nBuy CMP")
         self.assertIn("not listed", self.tg.last())
         self.post("NIFTY 22800PE\nBuy 100")
-        self.assertIn("Buy Above 100, Buy Near 90 or Buy CMP", self.tg.last())
+        self.assertIn("Buy Above 100, Buy Near 90, Buy Near 100-105, Buy only 100 or Buy CMP", self.tg.last())
         self.msg_id += 1
         self.bot.handle_update({"update_id": 1, "message": {
             "message_id": self.msg_id, "date": clock.now().timestamp() - 900, "chat": {"id": int(SIGNAL)},

@@ -27,6 +27,7 @@ from core import clock
 from core.logging_setup import get
 from data.instruments import InstrumentMaster
 from data.kite_gateway import KiteGateway, TokenExpired
+from execution.engine import CopyEngine
 from notify.telegram import TelegramClient, TelegramError, esc, ref
 from paper_trader import OPEN, PENDING, PaperTrader, money
 from signal_parser import BuyCall, parse, parse_command
@@ -41,7 +42,8 @@ class SignalBot:
         self.tg = TelegramClient()
         self.gw = KiteGateway()
         self.instruments = InstrumentMaster(self.gw)
-        self.trader = PaperTrader(self.gw, self.instruments, self.notify)
+        self.copy_engine = CopyEngine(notify=lambda text: self.notify(text, None, None))
+        self.trader = PaperTrader(self.gw, self.instruments, self.notify, copy=self.copy_engine.handle)
         self._stop = threading.Event()
         self._monitor: Optional[threading.Thread] = None
         self.stop_reason = "stopped"
@@ -74,6 +76,8 @@ class SignalBot:
             return False
 
         restored = self.trader.load()
+        self.copy_engine.recover(list(self.trader.positions.values()))
+        self.copy_engine.start()
         access = self.tg.read_access()
         if access:
             log.error(access)
@@ -92,6 +96,7 @@ class SignalBot:
         lines = [
             "🟢 <b>SIGNAL BOT ONLINE · PAPER</b>",
             f"{clock.now().strftime('%d %b %Y %H:%M')} IST · Kite {esc(self.gw.profile_name)}",
+            esc(self.copy_engine.status_line()),
             "",
             "Nearest expiries: " + esc(", ".join(expiries)),
             f"Open / waiting trades restored: {restored}" if restored else "No open trades.",
@@ -122,6 +127,7 @@ class SignalBot:
 
     def shutdown(self) -> None:
         self._stop.set()
+        self.copy_engine.stop()
         if self._monitor is not None:
             self._monitor.join(timeout=5.0)
         self.trader.save()

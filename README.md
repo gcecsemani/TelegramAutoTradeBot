@@ -89,10 +89,32 @@ Add the bot to both groups. In the signal group it must read normal messages (pr
 
 ```bash
 pip3 install -r requirements.txt     # first time only
-python3 login_zerodha.py             # fresh Kite token, every morning
+python3 login_zerodha.py             # market-data token, every morning
 python3 main.py --check              # Kite, contracts, Telegram access
-python3 main.py                      # run
+python3 main.py                      # signal book
+python3 -m portal                    # accounts, daily login, risk limits
 ```
+
+The `.env` Zerodha key is only the quote login. Orders go to accounts linked in the portal.
+
+## Copying into broker accounts
+
+A signal is decided once, from the live quote. That decision is then copied, in parallel, to every enabled account. One account's rejection or dead token does not stop the others.
+
+Each copy writes an order intent before calling the broker. The intent key is unique, and a Zerodha order is tagged with it. If the process dies after the send, recovery looks the order up by that tag instead of sending it again. Buys are limit + IOC at the account's slippage cap. Exits are market orders. A kill switch stops new buys immediately; exits still go out.
+
+| Control | Where |
+|---|---|
+| Lots, min, max, slippage | per symbol, in the portal. `*` is the default |
+| Max loss per trade | cuts the lot count. Below the minimum, the buy is skipped |
+| Max loss per day | same, and the auto kill switch can stop the account |
+| Kill switch / flatten | portal buttons. Flatten sells whatever that account still holds |
+| Daily Zerodha token | each user, from the portal, every morning |
+| Live orders | account mode **and** `LIVE_TRADING=1` |
+
+Dhan, Kotak and Groww can be saved in the portal. Only Zerodha places orders today; the others use the same adapter slot.
+
+On the droplet, `deploy/telegram-bot.service` and `deploy/portal.service` run the two processes as the `bot` user. Leave `PORTAL_HOST=127.0.0.1` and open it with `ssh -L 8080:127.0.0.1:8080 bot@YOUR_DROPLET`. The first registered user is the admin. Set `PORTAL_INVITE_CODE` before anyone else can register.
 
 `python3 main.py --parse "your message"` shows how a message is read (add `--reply` for a follow-up, and `--tagged "Sensex 72800 PE"` for a buy on a watchlist line).
 

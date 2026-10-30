@@ -71,12 +71,45 @@ class BuyCallTests(unittest.TestCase):
 
     def test_broken_calls_are_explained(self):
         for text, words in (("NIFTY 22800PE\nBuy 100", "Buy Above"),
-                            ("Nifty 22700 Pe buy @ 85 only", "Buy Above"),
                             ("NIFTY 22800PE\nBuy CMP\nSell 22900PE", "one option"),
                             ("XYZ 22800PE\nBuy CMP", "not recognised")):
             parsed = parse(text)
             self.assertEqual(parsed.kind, "INVALID", text)
             self.assertIn(words, parsed.error, text)
+
+
+    def test_range_only_and_book_prices(self):
+        parsed = parse("NIFTY 22800PE\nbuy above 100")
+        self.assertEqual((parsed.call.mode, parsed.call.level), ("ABOVE", 100))
+        parsed = parse("NIFTY 22800PE\nbuy near 100")
+        self.assertEqual((parsed.call.mode, parsed.call.level), ("NEAR", 100))
+        parsed = parse("NIFTY 22800PE\nbuy near 100-105\nbook near 130")
+        c = parsed.call
+        self.assertEqual((c.mode, c.level, c.level_high, c.book_level, c.book_pct),
+                         ("RANGE", 100, 105, 130, 100))
+        parsed = parse("NIFTY 22800PE\nbuy only 100\nbook 50 near 130")
+        c = parsed.call
+        self.assertEqual((c.mode, c.level, c.book_level, c.book_pct), ("ONLY", 100, 130, 50))
+        parsed = parse("Nifty 22700 Pe buy @ 85 only")
+        self.assertEqual((parsed.call.mode, parsed.call.level), ("ONLY", 85))
+        parsed = parse("NIFTY 22800PE\nbuy near 105-100")
+        self.assertEqual((parsed.call.level, parsed.call.level_high), (100, 105))
+
+    def test_entry_rules(self):
+        from paper_trader import PaperTrader, Position, Quote
+        pos = Position(
+            id="1", symbol="NIFTY", exchange="NFO", tradingsymbol="X", expiry="2026-11-03",
+            strike=22800, opt_type="PE", multiplier=65, tick_size=0.05, lots=2, status="PENDING",
+            signal_ref="1", signal_text="", created_at="", mode="RANGE", level=100, level_high=105,
+        )
+        trader = object.__new__(PaperTrader)
+        self.assertTrue(PaperTrader._entry_ready(trader, pos, Quote(104, 103, 104)))
+        self.assertTrue(PaperTrader._entry_ready(trader, pos, Quote(90, 89, 90)))
+        self.assertFalse(PaperTrader._entry_ready(trader, pos, Quote(106, 105.5, 106)))
+        pos.mode, pos.level = "ONLY", 100
+        self.assertTrue(PaperTrader._entry_ready(trader, pos, Quote(100, 99.9, 100)))
+        self.assertFalse(PaperTrader._entry_ready(trader, pos, Quote(99, 98.9, 99)))
+        self.assertFalse(PaperTrader._entry_ready(trader, pos, Quote(101, 100.5, 101)))
 
 
 class FollowUpTests(unittest.TestCase):
@@ -94,6 +127,12 @@ class FollowUpTests(unittest.TestCase):
             self.assertEqual(follow(text)[0], "FULL", text)
         for text in ("Book half", "Book 50", "Book 50%"):
             self.assertEqual(follow(text)[0], "HALF", text)
+        full = parse("book near 130", is_reply=True).follow_up
+        self.assertEqual((full.exit, full.book_level, full.book_pct), ("", 130, 100))
+        half = parse("book 50 near 130", is_reply=True).follow_up
+        self.assertEqual((half.exit, half.book_level, half.book_pct), ("", 130, 50))
+        self.assertEqual(parse("book 50% near 130", is_reply=True).follow_up.book_pct, 50)
+        self.assertEqual(parse("book near", is_reply=True).kind, "INVALID")
 
     def test_targets(self):
         self.assertEqual(follow("Tgt 110")[3], [110])

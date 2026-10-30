@@ -39,8 +39,9 @@ from core.ledger import PerformanceLedger
 from core.logging_setup import get
 from data.instruments import Contract, InstrumentMaster
 from data.kite_gateway import KiteGateway
+from execution.events import CopyEvent
 from notify.telegram import esc
-from signal_parser import BUY_RE, BuyCall, FollowUp, normalize, parse_call
+from signal_parser import BUY_ONLY_RE, BUY_RANGE_RE, BUY_RE, BuyCall, FollowUp, normalize, parse_call
 
 log = get("trader")
 
@@ -115,8 +116,11 @@ class Position:
     signal_ref: str                      # your call, "chat_id:message_id"
     signal_text: str
     created_at: str
-    mode: str = "CMP"                    # ABOVE / NEAR / CMP
+    mode: str = "CMP"                    # ABOVE / NEAR / RANGE / ONLY / CMP
     level: Optional[float] = None
+    level_high: float = 0.0              # Buy Near 100-105 buys at or below this
+    book_level: float = 0.0              # sell when LTP reaches this; 0 = off
+    book_pct: float = 0.0                # 100 = all, 50 = half, with book_level
     initial_lots: int = 0
     sl: Optional[float] = None
     no_sl: bool = False
@@ -131,6 +135,7 @@ class Position:
     last_ltp: float = 0.0
     closed_at: str = ""
     close_reason: str = ""
+    lot_size: int = 0                     # exchange quantity per lot; 0 = use multiplier
 
     @property
     def key(self) -> str:
@@ -171,26 +176,66 @@ class Position:
     def entry_text(self) -> str:
         if self.mode == "CMP":
             return "Buy CMP"
+        if self.mode == "ONLY":
+            return f"Buy only {self.level:g}"
+        if self.mode == "RANGE":
+            return f"Buy Near {self.level:g}-{self.level_high:g}"
         return f"Buy {self.mode.title()} {self.level:g}"
 
 
 def _signal_with_entry(text: str, call: BuyCall) -> str:
-    """The call text with its Buy Above / Near / CMP line swapped for this entry."""
-    entry = "Buy CMP" if call.mode == "CMP" else f"Buy {call.mode.title()} {call.level:g}"
-    updated, n = re.compile(BUY_RE.pattern, re.IGNORECASE).subn(entry, text, count=1)
-    return updated if n else text.rstrip() + "\n" + entry
+    """The call text with its buy line swapped for this entry."""
+    entry = call.entry_line()
+    for pattern in (BUY_RANGE_RE, BUY_ONLY_RE, BUY_RE):
+        updated, n = re.compile(pattern.pattern, re.IGNORECASE).subn(entry, text, count=1)
+        if n:
+            return updated
+    return text.rstrip() + "\n" + entry
+
+
+def _portion(lots: int, pct: float) -> int:
+    """Lots to sell for a percent of what is open. One lot cannot be split."""
+    if lots <= 0:
+        return 0
+    if pct >= 100:
+        return lots
+    n = int(round(lots * float(pct) / 100.0))
+    if lots == 1:
+        return 1
+    return max(1, min(lots, n))
 
 
 class PaperTrader:
-    def __init__(self, gateway: KiteGateway, instruments: InstrumentMaster, notify: Notify) -> None:
+    def __init__(self, gateway: KiteGateway, instruments: InstrumentMaster, notify: Notify,
+                 copy: Optional[Callable[[CopyEvent], None]] = None) -> None:
         self.gw = gateway
         self.instruments = instruments
         self.notify = notify
+        self.copy = copy
         self.lock = threading.RLock()
         self.positions: Dict[str, Position] = {}
         self.ledger = PerformanceLedger()
         self._quote_fail_since: Optional[float] = None
         self._quote_alerted = False
+
+    def _emit(self, event: CopyEvent) -> None:
+        """Hand a fill to the copy engine without waiting for the broker."""
+        if self.copy is None:
+            return
+        try:
+            threading.Thread(target=self.copy, args=(event,), name="copy-dispatch", daemon=True).start()
+        except Exception:
+            log.exception("Could not start the copy for %s", event.tradingsymbol)
+
+    def _emit_stop(self, pos: Position) -> None:
+        """Move or remove the resting stop on every account that holds this trade."""
+        self._emit(CopyEvent(
+            action="SL", position_id=pos.id, symbol=pos.symbol, exchange=pos.exchange,
+            tradingsymbol=pos.tradingsymbol, tick_size=pos.tick_size, multiplier=pos.multiplier,
+            lot_size=pos.lot_size, lots=pos.lots, lots_before=pos.lots,
+            price=pos.entry_price or pos.last_ltp or 0.0, sl=pos.sl, reason="SL UPDATE",
+            signal_ref=pos.signal_ref,
+        ))
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Persistence and lookup
@@ -320,6 +365,7 @@ class PaperTrader:
             opt_type=contract.opt_type,
             multiplier=contract.multiplier,
             tick_size=contract.tick_size,
+            lot_size=contract.lot_size,
             lots=lots,
             initial_lots=lots,
             status=PENDING,
@@ -328,6 +374,9 @@ class PaperTrader:
             created_at=clock.now().isoformat(),
             mode=call.mode,
             level=call.level,
+            level_high=float(call.level_high or 0),
+            book_level=float(call.book_level or 0),
+            book_pct=float(call.book_pct or 0) if call.book_level else 0.0,
             sl=call.sl,
             no_sl=call.no_sl,
             targets=list(call.targets),
@@ -370,7 +419,12 @@ class PaperTrader:
     def _entry_ready(self, pos: Position, quote: Quote) -> bool:
         if pos.mode == "CMP":
             return True
-        if quote.buy_price() > self._cap(pos):
+        ask = quote.buy_price()
+        if pos.mode == "ONLY":
+            return _round_tick(ask, pos.tick_size) == _round_tick(float(pos.level), pos.tick_size)
+        if pos.mode == "RANGE":
+            return ask <= float(pos.level_high or pos.level)
+        if ask > self._cap(pos):
             return False
         return pos.mode == "NEAR" or quote.ltp >= float(pos.level)
 
@@ -398,6 +452,13 @@ class PaperTrader:
         pos.last_ltp = quote.ltp
         pos.targets_hit = [t for t in pos.targets if t <= price]
         log.info("BUY %s %d lots @ %.2f  SL %s", pos.tradingsymbol, pos.lots, price, pos.sl_text())
+        self._emit(CopyEvent(
+            action="BUY", position_id=pos.id, symbol=pos.symbol, exchange=pos.exchange,
+            tradingsymbol=pos.tradingsymbol, tick_size=pos.tick_size, multiplier=pos.multiplier,
+            lot_size=pos.lot_size, lots=pos.lots, lots_before=pos.lots, price=price, sl=pos.sl,
+            reason="ENTRY", signal_ref=pos.signal_ref,
+            exact=pos.mode == "ONLY",
+        ))
         self._notify_opened(pos)
         return ""
 
@@ -409,6 +470,10 @@ class PaperTrader:
         if fu.buy_again:
             self.buy_again(pos, ref, fu.entry_mode, fu.entry_level)
             return
+        if fu.book_level:
+            self._set_book(pos, fu, ref)
+            self.save()
+            return
         if fu.exit:
             self._exit_on_reply(pos, fu.exit == "HALF", ref)
         else:
@@ -417,6 +482,56 @@ class PaperTrader:
             if fu.targets:
                 self._set_targets(pos, fu.targets, ref)
         self.save()
+
+    def _set_book(self, pos: Position, fu: FollowUp, ref: str) -> None:
+        level = float(fu.book_level or 0)
+        pct = float(fu.book_pct or 100)
+        with self.lock:
+            if pos.status not in (OPEN, PENDING):
+                self._already_done(pos, ref)
+                return
+            pos.book_level = level
+            pos.book_pct = pct
+            if pos.status == PENDING:
+                self.notify(
+                    f"📌 <b>Book armed</b> · {esc(pos.label)}\n"
+                    f"{esc(self._book_line(pos))} after the buy fills.",
+                    ref, pos.id,
+                )
+                return
+        try:
+            quote = self._quote(pos.key)
+        except Exception:
+            quote = None
+        with self.lock:
+            if pos.status != OPEN:
+                self._already_done(pos, ref)
+                return
+            if quote and quote.ltp >= level:
+                self._book_at(pos, quote, ref)
+                return
+            now = f"{quote.ltp:,.2f}" if quote else "unavailable"
+            self.notify(
+                f"📌 <b>Book armed</b> · {esc(pos.label)}\n"
+                f"{esc(self._book_line(pos))}. LTP now {now}.",
+                ref, pos.id,
+            )
+
+    def _book_at(self, pos: Position, quote: Quote, ref: str) -> bool:
+        level = pos.book_level
+        pct = pos.book_pct or 100
+        lots = _portion(pos.lots, pct)
+        pos.book_level = 0
+        pos.book_pct = 0
+        share = "all" if pct >= 100 else f"{pct:g}%"
+        ok = self._exit(
+            pos, lots, quote.sell_price(), "BOOK NEAR", ref,
+            f"LTP {quote.ltp:,.2f} ≥ {level:g} · booked {share}",
+        )
+        if not ok:
+            pos.book_level = level
+            pos.book_pct = pct
+        return ok
 
     def buy_again(self, pos: Position, ref: str, mode: str = "", level: Optional[float] = None) -> None:
         """The same call again — contract, SL and targets as posted — once the
@@ -497,6 +612,7 @@ class PaperTrader:
                 pos.sl, pos.no_sl = None, True
                 self.notify(f"🔧 <b>SL removed</b> · {esc(pos.label)}\n{esc(old)} → <b>none (hero zero)</b>",
                             ref, pos.id)
+                self._emit_stop(pos)
                 return
             if fu.sl == "COST":
                 level, name = pos.entry_price, "cost"
@@ -527,6 +643,7 @@ class PaperTrader:
             self.notify(f"🔧 <b>SL moved{' to ' + name if name else ''}</b> · {esc(pos.label)}\n"
                         f"{esc(old)} → <b>{level:,.2f}</b>\nLTP {ltp:,.2f} · entry {pos.entry_price:,.2f}",
                         ref, pos.id)
+            self._emit_stop(pos)
 
     def _set_targets(self, pos: Position, targets: List[float], ref: str) -> None:
         with self.lock:
@@ -556,6 +673,9 @@ class PaperTrader:
         if pos.status == PENDING:
             with self.lock:
                 pos.mode, pos.level = call.mode, call.level
+                pos.level_high = float(call.level_high or 0)
+                pos.book_level = float(call.book_level or 0)
+                pos.book_pct = float(call.book_pct or 0) if call.book_level else 0.0
                 pos.sl, pos.no_sl = call.sl, call.no_sl
                 pos.targets = list(call.targets)
                 self.notify(f"✏️ Edit applied to the waiting {esc(pos.label)}: {esc(pos.entry_text())}, "
@@ -663,6 +783,8 @@ class PaperTrader:
         if pos.sl is not None and quote.ltp <= pos.sl:
             return self._exit(pos, pos.lots, quote.sell_price(), "SL HIT", pos.signal_ref,
                               f"LTP {quote.ltp:,.2f} ≤ SL {pos.sl:,.2f}")
+        if pos.book_level > 0 and quote.ltp >= pos.book_level:
+            return self._book_at(pos, quote, pos.signal_ref)
         changed = False
         for number, target in enumerate(pos.targets, start=1):
             if target not in pos.targets_hit and quote.ltp >= target:
@@ -698,6 +820,7 @@ class PaperTrader:
         if price <= 0:
             log.warning("No price to exit %s (%s) — will retry", pos.tradingsymbol, reason)
             return False
+        lots_before = pos.lots
         lots = max(1, min(int(lots), pos.lots))
         price = _round_tick(price, pos.tick_size)
         now = clock.now().isoformat()
@@ -706,6 +829,12 @@ class PaperTrader:
         pos.costs.append({"time": now, "amount": config.TRADE["cost_per_order"]})
         pos.lots -= lots
         log.info("SELL %s %d lots @ %.2f (%s) pnl %.2f", pos.tradingsymbol, lots, price, reason, pnl)
+        self._emit(CopyEvent(
+            action="SELL", position_id=pos.id, symbol=pos.symbol, exchange=pos.exchange,
+            tradingsymbol=pos.tradingsymbol, tick_size=pos.tick_size, multiplier=pos.multiplier,
+            lot_size=pos.lot_size, lots=lots, lots_before=lots_before, price=price, sl=pos.sl,
+            reason=reason, signal_ref=pos.signal_ref,
+        ))
 
         if pos.lots > 0:
             lines = [
@@ -789,22 +918,35 @@ class PaperTrader:
             f"Entry <b>{pos.entry_price:,.2f}</b> × {_lots(pos.lots)} ({pos.lots * pos.multiplier} qty)",
             f"SL <b>{esc(pos.sl_text())}</b> · Targets {esc(targets)}",
         ]
+        if pos.book_level > 0:
+            lines.append(self._book_line(pos))
         if pos.sl_note:
             lines.append(f"<i>{esc(pos.sl_note)}</i>")
         self.notify("\n".join(lines), pos.signal_ref, pos.id)
 
+    def _book_line(self, pos: Position) -> str:
+        share = "everything" if pos.book_pct >= 100 else f"{pos.book_pct:g}%"
+        return f"Books {share} at {pos.book_level:g} or above"
+
     def _notify_waiting(self, pos: Position, quote: Quote) -> None:
-        cap = self._cap(pos)
-        if pos.mode == "ABOVE":
-            when = f"the premium is between {pos.level:g} and {cap:,.2f}"
+        if pos.mode == "ONLY":
+            when = f"the ask is exactly {pos.level:g}"
+        elif pos.mode == "RANGE":
+            when = f"the premium is {pos.level:g}–{pos.level_high:g} or below {pos.level_high:g}"
         else:
-            when = f"the premium is at or under {cap:,.2f}"
-        self.notify(
-            f"⏳ <b>WAITING · {esc(pos.label)}</b> · {esc(pos.entry_text())}\n"
-            f"Buys {_lots(pos.lots)} when {when} (LTP now {quote.ltp:,.2f})\n"
+            cap = self._cap(pos)
+            if pos.mode == "ABOVE":
+                when = f"the premium is between {pos.level:g} and {cap:,.2f}"
+            else:
+                when = f"the premium is at or under {cap:,.2f}"
+        lines = [
+            f"⏳ <b>WAITING · {esc(pos.label)}</b> · {esc(pos.entry_text())}",
+            f"Buys {_lots(pos.lots)} when {when} (LTP now {quote.ltp:,.2f})",
             f"SL {esc(pos.sl_text())} · valid until today's square-off",
-            pos.signal_ref, pos.id,
-        )
+        ]
+        if pos.book_level > 0:
+            lines.append(self._book_line(pos))
+        self.notify("\n".join(lines), pos.signal_ref, pos.id)
 
     def pnl_text(self) -> str:
         today = clock.today().isoformat()

@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram signal bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bot
+WorkingDirectory=/home/bot/TelegramAutoTradeBot
+ExecStart=/home/bot/TelegramAutoTradeBot/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Register{% endblock %}
+{% block body %}
+<section class="card narrow">
+  <h1>Register</h1>
+  {% if closed %}
+    <p>Registration is closed. The first user already exists, and no invite code is set on the server.</p>
+  {% else %}
+    <p class="lede">The first account on this server becomes the operator. Later people need the invite code.</p>
+    <form method="post" action="/register">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <div class="stack">
+        <div class="field">
+          <label for="email">Email</label>
+          <input id="email" name="email" type="email" value="{{ email or '' }}" autocomplete="username" required>
+        </div>
+        <div class="field">
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" minlength="8" autocomplete="new-password" required>
+        </div>
+        {% if needs_invite %}
+          <div class="field">
+            <label for="invite">Invite code</label>
+            <input id="invite" name="invite" autocomplete="off" required>
+          </div>
+        {% endif %}
+      </div>
+      <p class="form-actions"><button type="submit">Create account</button></p>
+    </form>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>{% block title %}Candle Crusher ALGO{% endblock %}</title>
+  <link rel="icon" href="/static/mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/portal.css?v=4">
+</head>
+<body>
+  <header class="top">
+    <div class="top-inner">
+      <a class="brand" href="/dashboard">
+        <img class="mark" src="/static/mark.svg" alt="" width="32" height="32">
+        <span>Candle Crusher<em>ALGO</em></span>
+      </a>
+      <nav class="nav">
+        {% if user %}
+          <a href="/dashboard">Accounts</a>
+          <a href="/orders">Orders</a>
+          <span class="who">{{ user.email }}{% if user.role == 'admin' %} · admin{% endif %}</span>
+          <form method="post" action="/logout">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <button type="submit">Log out</button>
+          </form>
+        {% else %}
+          <a href="/login">Log in</a>
+          <a href="/register">Register</a>
+        {% endif %}
+      </nav>
+    </div>
+  </header>
+  <main>
+    {% if msg %}<div class="banner">{{ msg }}</div>{% endif %}
+    {% if error %}<div class="banner error">{{ error }}</div>{% endif %}
+    {% block body %}{% endblock %}
+  </main>
+</body>
+</html>

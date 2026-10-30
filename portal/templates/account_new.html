@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Link a broker{% endblock %}
+{% block body %}
+<section class="card">
+  <h1>Link a broker</h1>
+  <p class="lede">Keys are encrypted on this server. The account starts in paper mode. Dhan, Kotak and Groww can be saved now; only Zerodha can send orders today.</p>
+  <form method="post" action="/accounts/new">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <div class="grid">
+      <div class="field">
+        <label for="label">Label</label>
+        <input id="label" name="label" value="{{ label or '' }}" required>
+      </div>
+      <div class="field">
+        <label for="broker">Broker</label>
+        <select id="broker" name="broker">
+          {% for key, cfg in brokers.items() %}
+            <option value="{{ key }}" {% if broker == key %}selected{% endif %}>{{ cfg.label }}{% if not cfg.live %} (soon){% endif %}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <label for="client_id">Client id (optional)</label>
+        <input id="client_id" name="client_id" value="{{ client_id or '' }}">
+      </div>
+      <div class="field">
+        <label for="api_key">API key</label>
+        <input id="api_key" name="api_key" autocomplete="off" required>
+      </div>
+      <div class="field">
+        <label for="api_secret">API secret</label>
+        <input id="api_secret" name="api_secret" type="password" autocomplete="new-password" required>
+      </div>
+    </div>
+    <p class="form-actions"><button type="submit">Save</button></p>
+  </form>
+</section>
+{% endblock %}

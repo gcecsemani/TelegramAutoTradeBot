@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Log in{% endblock %}
+{% block body %}
+<section class="card narrow">
+  <h1>Log in</h1>
+  <p class="lede">Daily broker login and risk limits for Candle Crusher ALGO.</p>
+  <form method="post" action="/login">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <div class="stack">
+      <div class="field">
+        <label for="email">Email</label>
+        <input id="email" name="email" type="email" value="{{ email or '' }}" autocomplete="username" required>
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+      </div>
+    </div>
+    <p class="form-actions"><button type="submit">Log in</button></p>
+  </form>
+  <p class="muted">First time on this server? <a href="/register">Register</a>.</p>
+</section>
+{% endblock %}

@@ -1,7 +1,8 @@
 """
 main.py
 =======
-    python3 main.py                          run the bot (paper)
+    python3 main.py                          signal book (paper). Copies go to portal accounts
+    python3 -m portal                        register, link a broker, daily token, risk limits
     python3 main.py --check                  check .env, Kite, instruments and Telegram access
     python3 main.py --parse "Nifty 22600 CE Buy near - 180 SL - 165"
                                              show how a message is read (offline)

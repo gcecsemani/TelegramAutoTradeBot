@@ -60,6 +60,14 @@ TELEGRAM_ALLOWED_USER_IDS = [
     item.strip() for item in _env_str("TELEGRAM_ALLOWED_USER_IDS", "").split(",") if item.strip()
 ]
 
+# The .env Zerodha key is the market-data login (quotes and contracts).
+# Orders go out only for portal accounts, and only when this is on.
+LIVE_TRADING = _env_str("LIVE_TRADING", "0").lower() in ("1", "true", "yes", "on")
+PORTAL_HOST = _env_str("PORTAL_HOST", "127.0.0.1")
+PORTAL_PORT = int(_env_str("PORTAL_PORT", "8080") or "8080")
+PORTAL_INVITE_CODE = _env_str("PORTAL_INVITE_CODE", "")
+PORTAL_HTTPS = _env_str("PORTAL_HTTPS", "0").lower() in ("1", "true", "yes", "on")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  2. INSTRUMENTS

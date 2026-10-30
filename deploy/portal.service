@@ -1,0 +1,15 @@
+[Unit]
+Description=Copy trading portal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bot
+WorkingDirectory=/home/bot/TelegramAutoTradeBot
+ExecStart=/home/bot/TelegramAutoTradeBot/.venv/bin/python -m portal
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
