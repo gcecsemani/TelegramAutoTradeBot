@@ -1,0 +1,8 @@
+[Unit]
+Description=Start or stop the signal bot around market hours
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/TelegramAutoTradeBot
+ExecStart=/opt/TelegramAutoTradeBot/.venv/bin/python -m core.market_hours

@@ -1,0 +1,10 @@
+[Unit]
+Description=Keep the signal bot inside market hours
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

@@ -34,6 +34,9 @@ class KiteGateway:
         self.profile_name = ""
         self.user_id = config.ZERODHA_USER_ID
 
+    def apply_token(self, access_token: str) -> None:
+        self.kite.set_access_token(access_token)
+
     def check_connection(self) -> bool:
         try:
             profile = kite_call(self.kite.profile)

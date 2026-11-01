@@ -13,8 +13,18 @@
       <p class="lede">Admin view: every account on this server. Each other person only sees the accounts they linked.</p>
     {% endif %}
   </div>
-  <a class="button" href="/accounts/new">Link a broker</a>
+  <div class="actions">
+    {% if user.role == 'admin' %}<a class="button ghost" href="/config">Config</a>{% endif %}
+    {% if user.role == 'admin' %}<a class="button ghost" href="/quote">Quote login</a>{% endif %}
+    <a class="button" href="/accounts/new">Link a broker</a>
+  </div>
 </div>
+{% if user.role == 'admin' %}
+<section class="card">
+  <h2>Two different Zerodha logins</h2>
+  <p class="lede"><a href="/quote">Quote login</a> renews the price feed in the server file. It does not place orders. <a href="/accounts/new">Link a broker</a> is a trading account: its own API key and its own morning login. Lot size and slippage are set once in <a href="/config">Config</a> and apply to every account. Leave an account on paper until a copy looks right, then arm live.</p>
+</section>
+{% endif %}
 {% for account in accounts %}
 <article class="card account">
   <div>
@@ -30,7 +40,7 @@
     </p>
     <div class="actions">
       <a class="button ghost" href="/accounts/{{ account.id }}">Settings</a>
-      {% if account.broker == 'zerodha' %}
+      {% if account.daily_auth %}
         <a class="button ghost" href="/accounts/{{ account.id }}/auth">Daily login</a>
       {% endif %}
     </div>
@@ -43,7 +53,7 @@
 {% else %}
 <section class="card">
   <h2>No brokers linked yet</h2>
-  <p class="lede">Add a Zerodha key to rehearse copies. The account stays on paper until you arm it.</p>
+  <p class="lede">Add a Zerodha or Kotak Neo account to rehearse copies. The account stays on paper until you arm it.</p>
 </section>
 {% endfor %}
 {% endblock %}

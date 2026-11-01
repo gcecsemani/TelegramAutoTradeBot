@@ -22,4 +22,4 @@ class CopyEvent:
     sl: Optional[float]
     reason: str
     signal_ref: str
-    exact: bool = False                  # limit at price exactly; ignore account slippage
+    exact: bool = False                  # limit at price exactly; ignore admin slippage

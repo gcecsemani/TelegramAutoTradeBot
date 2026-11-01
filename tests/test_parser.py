@@ -31,6 +31,9 @@ def follow(text):
 
 
 class BuyCallTests(unittest.TestCase):
+    def setUp(self):
+        signal_parser.register_names(["BAJAJ-AUTO", "BANKNIFTY", "M&M", "RELIANCE"])
+
     def test_sample_calls(self):
         cases = [
             ("NIFTY 22800PE\nBuy Above 100\nSl 80\nTgt 120 140 160++",
@@ -57,6 +60,9 @@ class BuyCallTests(unittest.TestCase):
         self.assertEqual(call("GOLDM 143000PE\nBuy Near 1450")[0], "GOLDM")
         self.assertEqual(call("SILVERM 195000 PE\nBuy CMP")[0], "SILVERM")
         self.assertEqual(call("BANK NIFTY 54200PE\nBuy CMP")[0], "BANKNIFTY")
+        signal_parser.register_names(["BAJAJ-AUTO"])
+        self.assertEqual(parse("BANK NIFTY 54200PE\nBuy CMP").kind, "INVALID")
+        signal_parser.register_names(["BAJAJ-AUTO", "BANKNIFTY", "M&M", "RELIANCE"])
         self.assertEqual(call("Bajaj auto 10000 PE\nBuy Near 105")[0], "BAJAJ-AUTO")
         self.assertEqual(call("nifty 22800 pe\nbuy above 100\nsl 80\ntgt 120 140 160++")[3], "ABOVE")
 
@@ -92,6 +98,9 @@ class BuyCallTests(unittest.TestCase):
         self.assertEqual((c.mode, c.level, c.book_level, c.book_pct), ("ONLY", 100, 130, 50))
         parsed = parse("Nifty 22700 Pe buy @ 85 only")
         self.assertEqual((parsed.call.mode, parsed.call.level), ("ONLY", 85))
+        for text in ("NIFTY 22800PE\nBuy.100", "NIFTY 22800PE\nBuy. 100", "NIFTY 22800PE\nbuy .100"):
+            parsed = parse(text)
+            self.assertEqual((parsed.kind, parsed.call.mode, parsed.call.level), ("BUY", "ONLY", 100), text)
         parsed = parse("NIFTY 22800PE\nbuy near 105-100")
         self.assertEqual((parsed.call.level, parsed.call.level_high), (100, 105))
 
@@ -117,8 +126,8 @@ class FollowUpTests(unittest.TestCase):
         self.assertEqual(follow("SL 70")[1:3], ("PRICE", 70))
         for text in ("SL to cost", "SL at cost", "SL at CTC", "SL CTC"):
             self.assertEqual(follow(text)[1], "COST", text)
-        for n in (1, 2, 3):
-            self.assertEqual(follow(f"SL to t{n}")[1:3], ("TARGET", n))
+        for text in ("SL to t1", "SL to t2", "SL to t3"):
+            self.assertEqual(parse(text, is_reply=True).kind, "NONE", text)
         for text in ("No sl", "Hero zero", "Hero to Zero"):
             self.assertEqual(follow(text)[1], "NONE", text)
 

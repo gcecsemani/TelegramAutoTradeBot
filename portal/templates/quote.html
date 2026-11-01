@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Quote login{% endblock %}
+{% block body %}
+<section class="card narrow">
+  <p class="kicker">Market data</p>
+  <h1>Quote login</h1>
+  <p class="lede">This Zerodha login only fetches prices and the contract list. It is not a trading account. The token dies every morning. Paste today's redirect and the running bot picks it up. No file edit and no restart.</p>
+  {% if not quote.has_key %}
+    <p class="warn">ZERODHA_API_KEY is missing from the server .env file.</p>
+  {% else %}
+    {% if login_url %}
+      <p><a class="button" href="{{ login_url }}" target="_blank" rel="noreferrer">Open Zerodha login</a></p>
+      <p class="url muted">{{ login_url }}</p>
+    {% endif %}
+    <p>Sign in, then copy the full redirect URL from the address bar. The page at <code>127.0.0.1</code> does not need to load.</p>
+    <form method="post" action="/quote">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <div class="field">
+        <label for="request_token">Redirect URL or request token</label>
+        <input id="request_token" name="request_token" autocomplete="off" required>
+      </div>
+      <p class="form-actions"><button type="submit">Save today's quote token</button></p>
+    </form>
+  {% endif %}
+  <p class="{{ 'ok' if quote.token_today else 'warn' }}">
+    {% if quote.token_today %}
+      Quote token is from today{% if quote.user_id %} ({{ quote.user_id }}){% endif %}.
+    {% elif quote.has_token %}
+      A token is saved{% if quote.token_date %} from {{ quote.token_date }}{% endif %}, not from this morning.
+    {% else %}
+      No quote token yet.
+    {% endif %}
+  </p>
+</section>
+{% endblock %}

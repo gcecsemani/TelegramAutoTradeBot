@@ -122,8 +122,8 @@ HOLIDAYS: list = []      # "YYYY-MM-DD" — entries are refused on these days
 #  4. TRADE RULES
 # ══════════════════════════════════════════════════════════════════════════════
 TRADE: dict = {
-    # Every trade is this many lots, on the nearest expiry. "Book half" sells
-    # half of what is open (1 of 2).
+    # Lots on the signal book, on the nearest expiry. "Book half" sells half
+    # of these. Linked accounts are sized from their own cash in the portal.
     "lots":                    2,
 
     # "Buy Above X": buys once the premium is at or above X, and no more

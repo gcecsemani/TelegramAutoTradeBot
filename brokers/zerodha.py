@@ -32,10 +32,27 @@ class ZerodhaBroker:
         if not api_key or not api_secret:
             raise BrokerError("Zerodha API key or secret is missing")
         self.api_secret = api_secret
-        self.kite = KiteConnect(api_key=api_key)
+        self.kite = KiteConnect(api_key=api_key, timeout=10)
         if access_token:
             self.kite.set_access_token(access_token)
         self._bucket = TokenBucket(2.0, 2)
+
+    def cash_balance(self, exchange: str) -> float:
+        """Cash used only to choose a lot size.
+
+        Opening cash plus money added today. Margin already in a position is
+        not subtracted, so one trade does not shrink the next.
+        """
+        self._pace()
+        try:
+            payload = self.kite.margins() or {}
+        except kite_exc.TokenException as exc:
+            raise TokenError(str(exc)) from exc
+        except kite_exc.InputException as exc:
+            raise BrokerError(str(exc)) from exc
+        except Exception as exc:
+            raise TransientError(str(exc)) from exc
+        return cash_from_margins(payload, exchange)
 
     def login_url(self) -> str:
         return self.kite.login_url()
@@ -67,7 +84,8 @@ class ZerodhaBroker:
             order_type = self.kite.ORDER_TYPE_MARKET
         else:
             order_type = self.kite.ORDER_TYPE_LIMIT
-        validity = self.kite.VALIDITY_IOC if order.validity == "IOC" else self.kite.VALIDITY_DAY
+        kind = order_validity(order.exchange, order.validity)
+        validity = self.kite.VALIDITY_IOC if kind == "IOC" else self.kite.VALIDITY_DAY
         self._pace()
         try:
             order_id = self.kite.place_order(
@@ -179,6 +197,51 @@ class ZerodhaBroker:
         wait = self._bucket.acquire()
         if wait > 0:
             time.sleep(wait)
+
+
+def order_validity(exchange: str, validity: str) -> str:
+    """MCX rejects IOC. Other exchanges keep the validity the engine asked for."""
+    if (exchange or "").upper() == "MCX":
+        return "DAY"
+    return "IOC" if (validity or "").upper() == "IOC" else "DAY"
+
+
+def cash_from_margins(payload: dict, exchange: str) -> float:
+    """Gross cash for this market. Equity for NFO/BFO, commodity for MCX.
+
+    When that wallet is missing, the other wallet is used so a missing
+    segment does not by itself refuse the trade. Utilised margin is ignored.
+    """
+    if not isinstance(payload, dict):
+        raise BrokerError("Zerodha did not return a balance")
+    primary = "commodity" if (exchange or "").upper() == "MCX" else "equity"
+    secondary = "equity" if primary == "commodity" else "commodity"
+    book = payload.get(primary)
+    if not isinstance(book, dict) or not book:
+        book = payload.get(secondary)
+    if not isinstance(book, dict) or not book:
+        raise BrokerError("Zerodha did not return a balance")
+    available = book.get("available") if isinstance(book.get("available"), dict) else {}
+    opening = _money(available.get("opening_balance"))
+    payin = _money(available.get("intraday_payin"))
+    if "opening_balance" in available or "intraday_payin" in available:
+        if opening > 0 or payin > 0:
+            return opening + payin
+    if "cash" in available and _money(available.get("cash")) > 0:
+        return _money(available.get("cash"))
+    if "opening_balance" in available or "intraday_payin" in available:
+        return max(0.0, opening + payin)
+    utilised = book.get("utilised") if isinstance(book.get("utilised"), dict) else {}
+    return max(0.0, _money(book.get("net")) + _money(utilised.get("debits")))
+
+
+def _money(value) -> float:
+    if value is None or value == "":
+        return 0.0
+    try:
+        return float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _view(row: dict) -> OrderView:

@@ -42,9 +42,10 @@ Buy Near 110
 |---|---|
 | `Buy Above 100` | the premium is at or above 100 **and** no more than 2.5% above it (≤ 102.50). If it has already run further, the bot waits for it to come back into 100–102.50 |
 | `Buy Near 90` | the price is anything up to 2.5% above 90 (≤ 92.25). Any lower price is fine |
+| `Buy only 100` · `Buy.100` · `Buy. 100` | only when the ask is exactly 100 |
 | `Buy CMP` | straight away, at the current price |
 
-- **Lots:** every trade is 2 lots (`TRADE["lots"]` in `config.py`).
+- **Lots:** the signal book takes 2 lots (`TRADE["lots"]` in `config.py`), so "book half" is half of that book. Each linked account is sized from its own cash on the portal Config page.
 - **Waiting calls:** a call still waiting is dropped at that day's square-off.
 - **No SL in the call:** the bot sets one 30% below the fill until you send yours.
 - **SL already broken:** if the price is already at or below your SL when it would buy, the call is refused (or dropped, if it was waiting).
@@ -57,7 +58,6 @@ Works the same for SENSEX, CRUDEOIL, NATURALGAS, GOLD(M), SILVER(M), BANKNIFTY a
 |---|---|
 | `SL 70` | SL to 70 |
 | `SL to cost` · `SL at cost` · `SL at CTC` · `SL CTC` | SL to your entry price |
-| `SL to t1` · `SL to t2` · `SL to t3` | SL to that target |
 | `No sl` · `Hero zero` · `Hero to Zero` | no SL |
 | `Exit` · `Book` · `Book full` · `Book fully` · `Ignore` · `Avoid` · `Cancel` · `Close` · `Sell` · `SL hit` | sells **both lots** now, in profit or loss. A call still waiting is dropped |
 | `Book half` · `Book 50` · `Book 50%` | sells **1 of the 2 lots** now. On the last lot it sells that one |
@@ -101,20 +101,24 @@ The `.env` Zerodha key is only the quote login. Orders go to accounts linked in 
 
 A signal is decided once, from the live quote. That decision is then copied, in parallel, to every enabled account. One account's rejection or dead token does not stop the others.
 
-Each copy writes an order intent before calling the broker. The intent key is unique, and a Zerodha order is tagged with it. If the process dies after the send, recovery looks the order up by that tag instead of sending it again. Buys are limit + IOC at the account's slippage cap. Exits are market orders. A kill switch stops new buys immediately; exits still go out.
+Each copy writes an order intent before calling the broker. The intent key is unique, and a Zerodha order is tagged with it. If the process dies after the send, recovery looks the order up by that tag instead of sending it again. Buys are limit + IOC at the admin slippage cap. Exits are market orders. A kill switch stops new buys immediately; exits still go out.
+
+Lot size is the account's cash divided by the rupees configured for that symbol, rounded down. NIFTY, SENSEX and BANKNIFTY start at ₹50,000 for one lot. Every other symbol starts at ₹100,000. An open position does not reduce the cash used for the next trade; the check only chooses the lot size. The broker can still reject an order if the exchange margin is not there.
 
 | Control | Where |
 |---|---|
-| Lots, min, max, slippage | per symbol, in the portal. `*` is the default |
-| Max loss per trade | cuts the lot count. Below the minimum, the buy is skipped |
+| Rupees per lot, slippage | admin Config page, shared by every account. `*` is every symbol without its own row. Slippage is percent or points |
+| Paper balance | on the account, used only while that account is on paper. Live reads the broker's cash |
+| Max loss per trade | cuts the lot count. Below 1 lot, the buy is skipped |
 | Max loss per day | same, and the auto kill switch can stop the account |
 | Kill switch / flatten | portal buttons. Flatten sells whatever that account still holds |
-| Daily Zerodha token | each user, from the portal, every morning |
+| Quote login | admin, portal page **Quote login**, every morning. Renews the `.env` price token. The running bot reads it without a restart |
+| Daily login | each trading account, from the portal, every morning. Zerodha pastes the redirect URL. Kotak Neo enters the authenticator code |
 | Live orders | account mode **and** `LIVE_TRADING=1` |
 
-Dhan, Kotak and Groww can be saved in the portal. Only Zerodha places orders today; the others use the same adapter slot.
+Kotak Neo uses the Trade API token as the API key, the MPIN as the secret, the UCC as the client id, and the registered mobile number. A Zerodha contract name is translated to Kotak's name before the order is sent. Dhan and Groww can be saved; they do not place orders yet.
 
-On the droplet, `deploy/telegram-bot.service` and `deploy/portal.service` run the two processes as the `bot` user. Leave `PORTAL_HOST=127.0.0.1` and open it with `ssh -L 8080:127.0.0.1:8080 bot@YOUR_DROPLET`. The first registered user is the admin. Set `PORTAL_INVITE_CODE` before anyone else can register.
+On the droplet, `deploy/telegram-bot.service` and `deploy/portal.service` run the two processes. To stop the signal bot outside market hours, disable that service and enable `deploy/market-hours.timer` instead. It starts the bot at 08:45 IST on trading days and stops it at 00:10, after the MCX close. Weekends and dates in `HOLIDAYS` stay stopped. The portal keeps running so the morning quote login still works. Leave `PORTAL_HOST=127.0.0.1` and open it with `ssh -L 8080:127.0.0.1:8080 bot@YOUR_DROPLET`. The first registered user is the admin. Set `PORTAL_INVITE_CODE` before anyone else can register.
 
 `python3 main.py --parse "your message"` shows how a message is read (add `--reply` for a follow-up, and `--tagged "Sensex 72800 PE"` for a buy on a watchlist line).
 
@@ -122,7 +126,7 @@ On the droplet, `deploy/telegram-bot.service` and `deploy/portal.service` run th
 
 | Path | What |
 |---|---|
-| `config.py` | instruments, sessions, lots, bands, default SL, costs |
+| `config.py` | instruments, sessions, signal-book lots, bands, default SL, costs |
 | `signal_parser.py` | message → buy call / follow-up / exit all |
 | `paper_trader.py` | entries, SL, targets, booking, square-off, journal |
 | `bot.py` | Telegram loop and message routing |

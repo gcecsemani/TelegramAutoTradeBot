@@ -1,7 +1,7 @@
 """
 execution/store.py
 ==================
-SQLite record of users, broker accounts, risk rules and order intents.
+SQLite record of users, broker accounts, admin copy rules and order intents.
 
 An intent row is written before the broker is called. The idempotency key is
 unique, so a retry or a second process cannot open a second order for the
@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     broker TEXT NOT NULL,
     label TEXT NOT NULL,
     client_id TEXT NOT NULL DEFAULT '',
+    mobile TEXT NOT NULL DEFAULT '',
     api_key_enc TEXT NOT NULL DEFAULT '',
     api_secret_enc TEXT NOT NULL DEFAULT '',
     access_token_enc TEXT NOT NULL DEFAULT '',
@@ -45,6 +46,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     flatten_on_kill INTEGER NOT NULL DEFAULT 0,
     max_loss_trade REAL,
     max_loss_day REAL,
+    paper_balance REAL NOT NULL DEFAULT 100000,
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS symbol_rules (
@@ -114,6 +116,15 @@ CREATE TABLE IF NOT EXISTS pnl (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pnl_day ON pnl(account_id, day);
+CREATE TABLE IF NOT EXISTS margin_rules (
+    symbol TEXT PRIMARY KEY,
+    rupees_per_lot REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS slippage_rules (
+    symbol TEXT PRIMARY KEY,
+    slippage_mode TEXT NOT NULL,
+    slippage_value REAL NOT NULL
+);
 """
 
 
@@ -131,6 +142,12 @@ def init() -> None:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
         if "role" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+        account_cols = {row[1] for row in conn.execute("PRAGMA table_info(accounts)")}
+        if "mobile" not in account_cols:
+            conn.execute("ALTER TABLE accounts ADD COLUMN mobile TEXT NOT NULL DEFAULT ''")
+        if "paper_balance" not in account_cols:
+            conn.execute("ALTER TABLE accounts ADD COLUMN paper_balance REAL NOT NULL DEFAULT 100000")
+        _seed_copy_rules(conn)
         intent_cols = {row[1] for row in conn.execute("PRAGMA table_info(intents)")}
         if "stop_trigger" not in intent_cols:
             conn.execute("ALTER TABLE intents ADD COLUMN stop_trigger REAL NOT NULL DEFAULT 0")
@@ -166,6 +183,31 @@ def _one(conn: sqlite3.Connection, sql: str, args: tuple = ()) -> Optional[dict]
 
 def _all(conn: sqlite3.Connection, sql: str, args: tuple = ()) -> List[dict]:
     return [dict(row) for row in conn.execute(sql, args).fetchall()]
+
+
+def _symbol_key(symbol: str) -> str:
+    text = (symbol or "").strip().upper()
+    return text or "*"
+
+
+def _seed_copy_rules(conn: sqlite3.Connection) -> None:
+    """First-run amounts. Later edits in the portal are left alone."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if int(conn.execute("SELECT COUNT(*) FROM margin_rules").fetchone()[0]) == 0:
+            conn.executemany(
+                "INSERT INTO margin_rules (symbol, rupees_per_lot) VALUES (?, ?)",
+                (("NIFTY", 50000), ("SENSEX", 50000), ("BANKNIFTY", 50000), ("*", 100000)),
+            )
+        if int(conn.execute("SELECT COUNT(*) FROM slippage_rules").fetchone()[0]) == 0:
+            conn.execute(
+                """INSERT INTO slippage_rules (symbol, slippage_mode, slippage_value)
+                   VALUES ('*', 'PERCENT', 1)"""
+            )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def count_users() -> int:
@@ -215,32 +257,25 @@ def user_by_id(user_id: int) -> Optional[dict]:
 
 
 def create_account(user_id: int, broker: str, label: str, client_id: str,
-                   api_key_enc: str, api_secret_enc: str) -> int:
+                   api_key_enc: str, api_secret_enc: str, mobile: str = "") -> int:
     now = clock.now().isoformat()
     with connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
         cur = conn.execute(
             """INSERT INTO accounts
-               (user_id, broker, label, client_id, api_key_enc, api_secret_enc, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (user_id, broker, label.strip(), client_id.strip(), api_key_enc, api_secret_enc, now),
+               (user_id, broker, label, client_id, mobile, api_key_enc, api_secret_enc, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, broker, label.strip(), client_id.strip(), (mobile or "").strip(),
+             api_key_enc, api_secret_enc, now),
         )
-        account_id = int(cur.lastrowid)
-        conn.execute(
-            """INSERT INTO symbol_rules
-               (account_id, symbol, lots, min_lots, max_lots, slippage_mode, slippage_value)
-               VALUES (?, '*', 2, 1, 2, 'PERCENT', 2.5)""",
-            (account_id,),
-        )
-        conn.execute("COMMIT")
-        return account_id
+        return int(cur.lastrowid)
 
 
 def update_account(account_id: int, user_id: Optional[int], fields: dict) -> None:
     allowed = {
-        "label", "client_id", "api_key_enc", "api_secret_enc", "mode", "enabled",
+        "label", "client_id", "mobile", "api_key_enc", "api_secret_enc", "mode", "enabled",
         "product", "kill_switch", "kill_reason", "auto_kill", "flatten_on_kill",
-        "max_loss_trade", "max_loss_day", "broker",
+        "max_loss_trade", "max_loss_day", "paper_balance", "broker",
+        "access_token_enc", "token_date",
     }
     sets, args = [], []
     for key, value in fields.items():
@@ -299,20 +334,6 @@ def copy_accounts() -> List[dict]:
         return _all(conn, "SELECT * FROM accounts WHERE enabled = 1 ORDER BY id")
 
 
-def upsert_rule(account_id: int, symbol: str, lots: int, min_lots: int, max_lots: int,
-                slippage_mode: str, slippage_value: float) -> None:
-    with connect() as conn:
-        conn.execute(
-            """INSERT INTO symbol_rules
-               (account_id, symbol, lots, min_lots, max_lots, slippage_mode, slippage_value)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(account_id, symbol) DO UPDATE SET
-                 lots = excluded.lots, min_lots = excluded.min_lots, max_lots = excluded.max_lots,
-                 slippage_mode = excluded.slippage_mode, slippage_value = excluded.slippage_value""",
-            (account_id, symbol, lots, min_lots, max_lots, slippage_mode, slippage_value),
-        )
-
-
 def delete_account(account_id: int, user_id: Optional[int] = None) -> str:
     """Remove an account and its rules, orders, and legs. Refuses while lots are open
     or an order is still unconfirmed. Returns a short reason, or "" when removed."""
@@ -347,32 +368,77 @@ def delete_account(account_id: int, user_id: Optional[int] = None) -> str:
     return ""
 
 
-def delete_rule(account_id: int, symbol: str) -> None:
-    if symbol == "*":
+def margin_rules() -> List[dict]:
+    with connect() as conn:
+        return _all(conn, "SELECT * FROM margin_rules ORDER BY symbol != '*', symbol")
+
+
+def upsert_margin(symbol: str, rupees_per_lot: float) -> None:
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO margin_rules (symbol, rupees_per_lot) VALUES (?, ?)
+               ON CONFLICT(symbol) DO UPDATE SET rupees_per_lot = excluded.rupees_per_lot""",
+            (_symbol_key(symbol), float(rupees_per_lot)),
+        )
+
+
+def delete_margin(symbol: str) -> None:
+    key = _symbol_key(symbol)
+    if key == "*":
         return
     with connect() as conn:
-        conn.execute("DELETE FROM symbol_rules WHERE account_id = ? AND symbol = ?", (account_id, symbol))
+        conn.execute("DELETE FROM margin_rules WHERE symbol = ?", (key,))
 
 
-def rules_for(account_id: int) -> List[dict]:
+def rupees_per_lot(symbol: str) -> float:
+    """Rupees of cash required for one lot. A named row wins; otherwise `*`."""
+    key = _symbol_key(symbol)
     with connect() as conn:
-        return _all(conn, "SELECT * FROM symbol_rules WHERE account_id = ? ORDER BY symbol != '*', symbol",
-                    (account_id,))
+        row = None
+        if key != "*":
+            row = _one(conn, "SELECT rupees_per_lot FROM margin_rules WHERE symbol = ?", (key,))
+        if row is None:
+            row = _one(conn, "SELECT rupees_per_lot FROM margin_rules WHERE symbol = '*'", ())
+    if row is None:
+        return 50000.0 if key in ("NIFTY", "SENSEX", "BANKNIFTY") else 100000.0
+    return float(row["rupees_per_lot"])
 
 
-def effective_rule(account_id: int, symbol: str) -> dict:
-    rows = {row["symbol"]: row for row in rules_for(account_id)}
-    base = rows.get("*") or {
-        "lots": 1, "min_lots": 1, "max_lots": 1,
-        "slippage_mode": "PERCENT", "slippage_value": 2.5,
-    }
-    over = rows.get((symbol or "").upper())
-    if not over:
-        return dict(base)
-    merged = dict(base)
-    for key in ("lots", "min_lots", "max_lots", "slippage_mode", "slippage_value"):
-        merged[key] = over[key]
-    return merged
+def slippage_rules() -> List[dict]:
+    with connect() as conn:
+        return _all(conn, "SELECT * FROM slippage_rules ORDER BY symbol != '*', symbol")
+
+
+def upsert_slippage(symbol: str, mode: str, value: float) -> None:
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO slippage_rules (symbol, slippage_mode, slippage_value) VALUES (?, ?, ?)
+               ON CONFLICT(symbol) DO UPDATE SET
+                 slippage_mode = excluded.slippage_mode,
+                 slippage_value = excluded.slippage_value""",
+            (_symbol_key(symbol), mode, float(value)),
+        )
+
+
+def delete_slippage(symbol: str) -> None:
+    key = _symbol_key(symbol)
+    if key == "*":
+        return
+    with connect() as conn:
+        conn.execute("DELETE FROM slippage_rules WHERE symbol = ?", (key,))
+
+
+def effective_slippage(symbol: str) -> dict:
+    key = _symbol_key(symbol)
+    with connect() as conn:
+        row = None
+        if key != "*":
+            row = _one(conn, "SELECT * FROM slippage_rules WHERE symbol = ?", (key,))
+        if row is None:
+            row = _one(conn, "SELECT * FROM slippage_rules WHERE symbol = '*'", ())
+    if row is None:
+        return {"slippage_mode": "PERCENT", "slippage_value": 1.0}
+    return {"slippage_mode": row["slippage_mode"], "slippage_value": float(row["slippage_value"])}
 
 
 def claim_intent(row: dict) -> bool:
@@ -557,6 +623,27 @@ def day_realized(account_id: int, day: Optional[str] = None) -> float:
             (account_id, day),
         ).fetchone()
         return float(row[0] or 0)
+
+
+def latest_action(account_id: int, position_id: str, action: str) -> Optional[dict]:
+    with connect() as conn:
+        return _one(
+            conn,
+            """SELECT * FROM intents
+               WHERE account_id = ? AND position_id = ? AND action = ?
+               ORDER BY id DESC LIMIT 1""",
+            (account_id, position_id, action),
+        )
+
+
+def count_action_status(account_id: int, position_id: str, action: str, status: str) -> int:
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT COUNT(*) FROM intents
+               WHERE account_id = ? AND position_id = ? AND action = ? AND status = ?""",
+            (account_id, position_id, action, status),
+        ).fetchone()
+        return int(row[0] or 0)
 
 
 def active_sell(account_id: int, position_id: str) -> Optional[dict]:

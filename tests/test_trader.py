@@ -244,7 +244,7 @@ class EntryTests(Harness):
         self.post("NIFTY 22825PE\nBuy CMP")
         self.assertIn("not listed", self.tg.last())
         self.post("NIFTY 22800PE\nBuy 100")
-        self.assertIn("Buy Above 100, Buy Near 90, Buy Near 100-105, Buy only 100 or Buy CMP", self.tg.last())
+        self.assertIn("Buy Above 100, Buy Near 90, Buy Near 100-105, Buy only 100, Buy.100 or Buy CMP", self.tg.last())
         self.msg_id += 1
         self.bot.handle_update({"update_id": 1, "message": {
             "message_id": self.msg_id, "date": clock.now().timestamp() - 900, "chat": {"id": int(SIGNAL)},
@@ -318,26 +318,18 @@ class FollowUpTests(Harness):
             pos.sl = 80.0
             self.post(text, reply_to=call)
             self.assertEqual(pos.sl, 100.0, text)
-        self.post("SL to t1", reply_to=call)
-        self.assertEqual(pos.sl, 110.0)
-        self.post("SL to t2", reply_to=call)
-        self.assertEqual(pos.sl, 130.0)
-        self.post("SL to t3", reply_to=call)                     # 150 is above the live 135
-        self.assertEqual(pos.sl, 130.0)
+        self.post("SL 140", reply_to=call)                       # above the live 135
+        self.assertEqual(pos.sl, 100.0)
         self.assertIn("not below the live premium", self.tg.last())
+        count = len(self.tg.sent)
+        self.post("SL to t1", reply_to=call)
+        self.assertEqual((pos.sl, len(self.tg.sent)), (100.0, count))
         for text in ("No sl", "Hero zero", "Hero to Zero"):
             pos.sl, pos.no_sl = 90.0, False
             self.post(text, reply_to=call)
             self.assertEqual((pos.sl, pos.no_sl), (None, True), text)
         self.price(10.0)
         self.assertEqual(pos.status, "OPEN")                      # no SL, nothing fires
-
-    def test_sl_to_a_missing_target(self):
-        call, pos = self.open_trade("NIFTY 22800PE\nBuy CMP\nSl 80")
-        self.gw.set(PE, 120.0)
-        self.post("SL to t1", reply_to=call)
-        self.assertEqual(pos.sl, 80.0)
-        self.assertIn("has no target 1", self.tg.last())
 
     def test_targets_and_hold_ignored(self):
         call, pos = self.open_trade("NIFTY 22800PE\nBuy CMP\nSl 80")

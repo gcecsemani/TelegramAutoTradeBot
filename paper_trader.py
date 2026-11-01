@@ -303,6 +303,10 @@ class PaperTrader:
         with self.lock:
             return [p for p in self.positions.values() if p.status in (OPEN, PENDING)]
 
+    def snapshot(self) -> List[Position]:
+        with self.lock:
+            return list(self.positions.values())
+
     # ══════════════════════════════════════════════════════════════════════════
     #  Market data
     # ══════════════════════════════════════════════════════════════════════════
@@ -598,7 +602,7 @@ class PaperTrader:
                 elif fu.sl == "PRICE":
                     pos.sl, pos.no_sl = fu.sl_value, False
                 else:
-                    self.notify(f"⚠️ {esc(pos.label)} is not bought yet — SL to cost / to a target "
+                    self.notify(f"⚠️ {esc(pos.label)} is not bought yet — SL to cost "
                                 "works after the fill.", ref, pos.id)
                     return
                 self.notify(f"🔧 SL for the waiting {esc(pos.label)} is now {esc(pos.sl_text())}. "
@@ -616,14 +620,6 @@ class PaperTrader:
                 return
             if fu.sl == "COST":
                 level, name = pos.entry_price, "cost"
-            elif fu.sl == "TARGET":
-                number = int(fu.sl_value)
-                if number > len(pos.targets):
-                    self.notify(f"⚠️ {esc(pos.label)} has no target {number}"
-                                f"{' (targets ' + ' / '.join(f'{t:g}' for t in pos.targets) + ')' if pos.targets else ''}"
-                                ". SL not changed.", ref, pos.id)
-                    return
-                level, name = pos.targets[number - 1], f"target {number}"
             else:
                 level, name = fu.sl_value, ""
         quote = self._quote(pos.key)
@@ -808,7 +804,8 @@ class PaperTrader:
         elif not self._quote_alerted and \
                 time.monotonic() - self._quote_fail_since > config.ENGINE["quote_outage_alert_sec"]:
             self._quote_alerted = True
-            self.notify("⚠️ No live quotes from Kite for a minute — SL checks are paused until they return.",
+            self.notify("⚠️ No live quotes from Kite for a minute. Signal-book stop checks are paused "
+                        "until prices return. A stop already placed at a broker stays there.",
                         None, None)
 
     # ══════════════════════════════════════════════════════════════════════════

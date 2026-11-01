@@ -23,7 +23,7 @@ import re
 import sys
 import webbrowser
 
-from dotenv import load_dotenv, set_key
+from dotenv import load_dotenv
 from kiteconnect import KiteConnect
 
 ENV_FILE = os.path.join(os.path.dirname(__file__), ".env")
@@ -96,10 +96,8 @@ def main() -> None:
     user_id      = session_data.get("user_id", "")
     user_name    = session_data.get("user_name", "")
 
-    # ── Save to .env ──────────────────────────────────────────────────────────
-    set_key(ENV_FILE, "ZERODHA_ACCESS_TOKEN", access_token)
-    if user_id:
-        set_key(ENV_FILE, "ZERODHA_USER_ID", user_id)
+    from core.quote_login import save
+    save(access_token, user_id, ENV_FILE)
 
     _banner("LOGIN SUCCESSFUL")
     print(f"  User     : {user_name} ({user_id})")

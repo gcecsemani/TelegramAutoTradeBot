@@ -4,10 +4,13 @@ execution/risk.py
 Pure sizing rules. No broker and no database, so a bad limit is refused
 before an order exists.
 
-    lots            clamped into [min_lots, max_lots]
+    lots            balance ÷ rupees per lot, then clamped into [min_lots, max_lots]
     slippage        buy limit = reference + points, or reference + percent
     max loss/trade  drops the lot count so (entry - SL) × lots stays inside it
     max loss/day    same, using the loss budget still left today
+
+The balance check only chooses the lot count. It does not look at open
+positions, so one trade does not shrink or block the next.
 """
 
 from __future__ import annotations
@@ -22,6 +25,18 @@ class BuyPlan:
     quantity: int
     limit_price: float
     reason: str
+
+
+def lots_for_balance(balance: float, rupees_per_lot: float) -> int:
+    """How many lots this cash pays for. Rounded down. Open positions are not an input."""
+    try:
+        cash = float(balance)
+        per = float(rupees_per_lot)
+    except (TypeError, ValueError):
+        return 0
+    if cash <= 0 or per <= 0:
+        return 0
+    return int(cash // per)
 
 
 def round_tick(price: float, tick: float) -> float:

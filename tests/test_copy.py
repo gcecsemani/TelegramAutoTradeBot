@@ -9,11 +9,14 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config                               # noqa: E402
-from brokers.base import OrderView, TransientError  # noqa: E402
+from brokers.base import BrokerError, OrderView, TransientError  # noqa: E402
+from brokers.kotak import cash_from_limits  # noqa: E402
+from brokers.zerodha import cash_from_margins, order_validity  # noqa: E402
 from execution import store                 # noqa: E402
+from execution import engine as copy_engine  # noqa: E402
 from execution.engine import CopyEngine     # noqa: E402
 from execution.events import CopyEvent      # noqa: E402
-from execution.risk import buy_limit, order_quantity, plan_buy, sell_lots  # noqa: E402
+from execution.risk import buy_limit, lots_for_balance, order_quantity, plan_buy, sell_lots  # noqa: E402
 
 
 def _event(**overrides) -> CopyEvent:
@@ -60,6 +63,41 @@ class RiskTests(unittest.TestCase):
         )
         self.assertFalse(plan.ok)
 
+    def test_balance_sets_lots_without_looking_at_open_positions(self):
+        self.assertEqual(lots_for_balance(50000, 50000), 1)
+        self.assertEqual(lots_for_balance(149999, 50000), 2)
+        self.assertEqual(lots_for_balance(200000, 100000), 2)
+        self.assertEqual(lots_for_balance(49999, 50000), 0)
+
+    def test_broker_cash_ignores_margin_already_in_use(self):
+        margins = {
+            "equity": {
+                "available": {"opening_balance": 150000, "intraday_payin": 0, "cash": 150000, "live_balance": 10000},
+                "utilised": {"debits": 140000},
+                "net": 10000,
+            },
+            "commodity": {
+                "available": {"opening_balance": 80000, "intraday_payin": 20000, "cash": 100000, "live_balance": 5000},
+                "utilised": {"debits": 95000},
+                "net": 5000,
+            },
+        }
+        self.assertEqual(cash_from_margins(margins, "NFO"), 150000)
+        self.assertEqual(cash_from_margins(margins, "MCX"), 100000)
+        equity_only = {"equity": margins["equity"]}
+        self.assertEqual(cash_from_margins(equity_only, "MCX"), 150000)
+        self.assertRaises(BrokerError, cash_from_margins, {}, "NFO")
+        self.assertEqual(order_validity("NFO", "IOC"), "IOC")
+        self.assertEqual(order_validity("MCX", "IOC"), "DAY")
+
+        kotak = [
+            {"Category": "FO", "Net": "40000", "MarginUsed": "110000"},
+            {"Category": "COM", "Net": "20000", "MarginUsed": "80000"},
+        ]
+        self.assertEqual(cash_from_limits(kotak, "NFO"), 150000)
+        self.assertEqual(cash_from_limits(kotak, "MCX"), 100000)
+        self.assertEqual(cash_from_limits({"Net": "50000", "MarginUsed": "0"}, "NFO"), 50000)
+
     def test_sell_fraction_matches_the_master(self):
         self.assertEqual(sell_lots(4, 1, 2), 2)
         self.assertEqual(sell_lots(1, 1, 2), 1)
@@ -90,7 +128,7 @@ class FanoutTests(unittest.TestCase):
         by_account = {row["account_id"]: row for row in buys}
         self.assertEqual(by_account[self.one]["status"], "FILLED")
         self.assertEqual(by_account[self.one]["quantity"], 130)
-        self.assertEqual(by_account[self.one]["limit_price"], 102.5)
+        self.assertEqual(by_account[self.one]["limit_price"], 101.0)
         self.assertEqual(by_account[self.two]["status"], "SKIPPED")
         self.assertIn("kill switch", by_account[self.two]["reason"])
 
@@ -163,6 +201,74 @@ class FanoutTests(unittest.TestCase):
         self.assertEqual(store.get_leg(self.one, "pos-timeout")["lots_open"], 2)
         self.assertEqual(store.get_leg(self.one, "pos-timeout")["sl_status"], "WORKING")
 
+    def test_lot_size_follows_cash_and_an_open_position_does_not_shrink_the_next(self):
+        store.update_account(self.one, self.user, {"paper_balance": 150000})
+        self.engine.handle(_event(position_id="pos-a"))
+        first = store.buy_intent(self.one, "pos-a")
+        self.assertEqual(first["status"], "FILLED")
+        self.assertEqual(first["lots"], 3)
+
+        self.engine.handle(_event(
+            position_id="pos-b", symbol="CRUDEOIL", exchange="MCX",
+            tradingsymbol="CRUDEOIL26NOV5200CE", lot_size=1, multiplier=100,
+        ))
+        second = store.buy_intent(self.one, "pos-b")
+        self.assertEqual(second["status"], "FILLED")
+        self.assertEqual(second["lots"], 1)
+        self.assertEqual(store.get_leg(self.one, "pos-a")["lots_open"], 3)
+
+        store.update_account(self.one, self.user, {"paper_balance": 40000})
+        self.engine.handle(_event(position_id="pos-small"))
+        skipped = store.buy_intent(self.one, "pos-small")
+        self.assertEqual(skipped["status"], "SKIPPED")
+        self.assertIn("50,000", skipped["reason"])
+
+    def test_admin_slippage_is_percent_or_points_for_one_symbol(self):
+        store.upsert_slippage("NIFTY", "POINTS", 1.5)
+        self.engine.handle(_event(position_id="pos-points"))
+        nifty = store.buy_intent(self.one, "pos-points")
+        self.assertEqual(nifty["limit_price"], 101.5)
+        self.engine.handle(_event(
+            position_id="pos-crude", symbol="CRUDEOIL", exchange="MCX",
+            tradingsymbol="CRUDEOIL26NOV5200CE", lot_size=1, multiplier=100,
+        ))
+        crude = store.buy_intent(self.one, "pos-crude")
+        self.assertEqual(crude["limit_price"], 101.0)
+
+    def test_a_live_account_sizes_from_broker_cash(self):
+        class Funds:
+            def cash_balance(self, exchange):
+                return 200000 if exchange == "NFO" else 0
+
+            def place(self, order):
+                if order.order_type == "SL-M":
+                    return OrderView(f"sl-{order.tag}", "OPEN", 0, 0, "stop")
+                return OrderView("OID", "COMPLETE", order.price or 100, order.quantity, "accepted")
+
+            def find_by_tag(self, tag):
+                return None
+
+            def fetch(self, order_id):
+                return None
+
+            def cancel(self, order_id):
+                return OrderView(order_id, "CANCELLED", 0, 0, "cancelled")
+
+            def modify(self, order_id, trigger_price, quantity):
+                return OrderView(order_id, "OPEN", 0, 0, "modified")
+
+        config.LIVE_TRADING = True
+        store.update_account(self.one, self.user, {"mode": "live", "paper_balance": 10000})
+        store.set_token(self.one, "token", "AB1234")
+        self.engine.broker_factory = lambda account: Funds()
+        self.engine.handle(_event(position_id="pos-live-size"))
+        row = store.buy_intent(self.one, "pos-live-size")
+        self.assertEqual(row["status"], "FILLED")
+        self.assertEqual(row["lots"], 4)
+        self.engine.handle(_event(position_id="pos-live-again"))
+        again = store.buy_intent(self.one, "pos-live-again")
+        self.assertEqual(again["lots"], 4)
+
     def test_an_exact_price_buy_does_not_add_slippage(self):
         self.engine.handle(_event(position_id="pos-exact", price=100, exact=True))
         self.assertEqual(store.buy_intent(self.one, "pos-exact")["limit_price"], 100)
@@ -232,6 +338,143 @@ class FanoutTests(unittest.TestCase):
                                    price=70, sl=70, reason="SL HIT"))
         self.assertEqual(broker.market_sells, 0)
         self.assertEqual(store.get_leg(self.one, "pos-stopped")["lots_open"], 0)
+
+    def test_a_missing_order_is_not_sent_again(self):
+        class Lost:
+            def __init__(self):
+                self.placed = 0
+
+            def place(self, order):
+                self.placed += 1
+                raise TransientError("timed out")
+
+            def find_by_tag(self, tag):
+                return None
+
+            def fetch(self, order_id):
+                return None
+
+        broker = Lost()
+        self.engine.broker_factory = lambda account: broker
+        copy_engine._LOOKUP_GRACE_SEC = 0
+        try:
+            self.engine.handle(_event(position_id="pos-lost"))
+            self.engine.reconcile()
+        finally:
+            copy_engine._LOOKUP_GRACE_SEC = 20
+        self.assertEqual(broker.placed, 1)
+        row = store.buy_intent(self.one, "pos-lost")
+        self.assertEqual(row["status"], "UNKNOWN")
+        self.assertEqual(row["reason"], "UNCONFIRMED")
+
+    def test_a_partial_ioc_fill_is_booked_and_protected(self):
+        class Partial:
+            def place(self, order):
+                if order.order_type == "SL-M":
+                    return OrderView("SL1", "OPEN", 0, 0, "stop")
+                return OrderView("B1", "CANCELLED", order.price or 100, order.quantity // 2, "partial")
+
+            def find_by_tag(self, tag):
+                return None
+
+            def fetch(self, order_id):
+                return None
+
+            def cancel(self, order_id):
+                return OrderView(order_id, "CANCELLED", 0, 0, "cancelled")
+
+            def modify(self, order_id, trigger_price, quantity):
+                return OrderView(order_id, "OPEN", 0, 0, "modified")
+
+        self.engine.broker_factory = lambda account: Partial()
+        self.engine.handle(_event(position_id="pos-partial"))
+        leg = store.get_leg(self.one, "pos-partial")
+        self.assertEqual(leg["lots_open"], 1)
+        self.assertEqual(leg["quantity_open"], 65)
+        self.assertEqual(leg["sl_status"], "WORKING")
+        self.assertEqual(leg["sl_quantity"], 65)
+
+    def test_an_exit_retries_when_the_stop_is_still_working(self):
+        class Sticky:
+            def __init__(self):
+                self.cancels = 0
+                self.market_sells = 0
+
+            def place(self, order):
+                if order.order_type == "SL-M":
+                    return OrderView("SL1", "OPEN", 0, 0, "working")
+                if order.side == "SELL":
+                    self.market_sells += 1
+                return OrderView("B1", "COMPLETE", order.price or 100, order.quantity, "filled")
+
+            def cancel(self, order_id):
+                self.cancels += 1
+                if self.cancels == 1:
+                    return OrderView(order_id, "OPEN", 0, 0, "still working")
+                return OrderView(order_id, "CANCELLED", 0, 0, "cancelled")
+
+            def fetch(self, order_id):
+                return OrderView(order_id, "OPEN", 0, 0, "working")
+
+            def modify(self, order_id, trigger_price, quantity):
+                return OrderView(order_id, "OPEN", 0, 0, "modified")
+
+            def find_by_tag(self, tag):
+                return None
+
+        broker = Sticky()
+        self.engine.broker_factory = lambda account: broker
+        self.engine.handle(_event(position_id="pos-sticky", sl=70))
+        self.engine.handle(_event(action="SELL", position_id="pos-sticky", lots=2, lots_before=2,
+                                   price=90, sl=70, reason="EXIT"))
+        self.assertEqual(broker.market_sells, 0)
+        self.assertEqual(store.get_leg(self.one, "pos-sticky")["lots_open"], 2)
+        waiting = store.active_sell(self.one, "pos-sticky")
+        self.assertEqual(waiting["status"], "WAITING")
+        copy_engine._EXIT_RETRY_SEC = 0
+        try:
+            self.engine.reconcile()
+        finally:
+            copy_engine._EXIT_RETRY_SEC = 3
+        self.assertEqual(broker.market_sells, 1)
+        self.assertEqual(store.get_leg(self.one, "pos-sticky")["lots_open"], 0)
+
+    def test_a_rejected_stop_is_placed_again(self):
+        class FlakyStop:
+            def __init__(self):
+                self.stops = 0
+
+            def place(self, order):
+                if order.order_type == "SL-M":
+                    self.stops += 1
+                    if self.stops == 1:
+                        raise BrokerError("trigger rejected")
+                    return OrderView("SL1", "OPEN", 0, 0, "stop")
+                return OrderView("B1", "COMPLETE", order.price or 100, order.quantity, "filled")
+
+            def find_by_tag(self, tag):
+                return None
+
+            def fetch(self, order_id):
+                return None
+
+            def cancel(self, order_id):
+                return OrderView(order_id, "CANCELLED", 0, 0, "cancelled")
+
+            def modify(self, order_id, trigger_price, quantity):
+                return OrderView(order_id, "OPEN", 0, 0, "modified")
+
+        broker = FlakyStop()
+        self.engine.broker_factory = lambda account: broker
+        self.engine.handle(_event(position_id="pos-flaky", sl=70))
+        self.assertEqual(store.get_leg(self.one, "pos-flaky")["sl_status"], "FAILED")
+        copy_engine._STOP_RETRY_SEC = 0
+        try:
+            self.engine.reconcile()
+        finally:
+            copy_engine._STOP_RETRY_SEC = 15
+        self.assertEqual(broker.stops, 2)
+        self.assertEqual(store.get_leg(self.one, "pos-flaky")["sl_status"], "WORKING")
 
 
 if __name__ == "__main__":

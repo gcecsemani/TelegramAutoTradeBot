@@ -9,7 +9,7 @@
   </div>
   <p class="{{ 'ok' if not account.block else 'warn' }}">
     {% if account.block %}Cannot buy: {{ account.block }}{% else %}Ready to copy buys{% endif %}
-    {% if account.broker == 'zerodha' %} · <a href="/accounts/{{ account.id }}/auth">Daily Zerodha login</a>{% endif %}
+    {% if account.daily_auth %} · <a href="/accounts/{{ account.id }}/auth">Daily login</a>{% endif %}
   </p>
   <div class="actions">
     <form method="post" action="/accounts/{{ account.id }}/kill">
@@ -55,6 +55,10 @@
         <input id="client_id" name="client_id" value="{{ account.client_id }}">
       </div>
       <div class="field">
+        <label for="mobile">Mobile</label>
+        <input id="mobile" name="mobile" value="{{ account.mobile or '' }}" placeholder="+919876543210" autocomplete="tel">
+      </div>
+      <div class="field">
         <label for="product">Product</label>
         <select id="product" name="product">
           <option value="MIS" {% if account.product == 'MIS' %}selected{% endif %}>MIS (intraday)</option>
@@ -62,11 +66,11 @@
         </select>
       </div>
       <div class="field">
-        <label for="api_key">API key {% if account.has_key %}(saved, leave blank to keep){% endif %}</label>
+        <label for="api_key">API key / Trade API token {% if account.has_key %}(saved, leave blank to keep){% endif %}</label>
         <input id="api_key" name="api_key" autocomplete="off">
       </div>
       <div class="field">
-        <label for="api_secret">API secret {% if account.has_secret %}(saved, leave blank to keep){% endif %}</label>
+        <label for="api_secret">API secret / MPIN {% if account.has_secret %}(saved, leave blank to keep){% endif %}</label>
         <input id="api_secret" name="api_secret" type="password" autocomplete="new-password">
       </div>
       <div class="field">
@@ -77,7 +81,12 @@
         <label for="max_loss_day">Max loss per day (₹, blank = no cap)</label>
         <input id="max_loss_day" name="max_loss_day" inputmode="decimal" value="{{ account.max_loss_day if account.max_loss_day is not none else '' }}">
       </div>
+      <div class="field">
+        <label for="paper_balance">Paper balance (₹)</label>
+        <input id="paper_balance" name="paper_balance" inputmode="decimal" value="{{ account.paper_balance }}" required>
+      </div>
     </div>
+    <p class="muted">Lot size is this balance divided by the admin amount for the symbol, rounded down. Live orders use the broker's cash at the moment of the order, and an open position does not change the next lot size. Paper lot size at the saved balance:{% for item in lot_preview %} {{ item.label }} {{ item.lots }}{% if not loop.last %},{% endif %}{% endfor %}.</p>
     <div class="checks">
       <label class="check"><input type="checkbox" name="enabled" value="1" {% if account.enabled %}checked{% endif %}> Enabled for copy</label>
       <label class="check"><input type="checkbox" name="auto_kill" value="1" {% if account.auto_kill %}checked{% endif %}> Auto kill switch when the day's loss limit is hit</label>
@@ -93,51 +102,4 @@
   </form>
 </section>
 
-<section class="card">
-  <h2>Lots and slippage per symbol</h2>
-  <p class="lede"><code>*</code> is the default. A named symbol (NIFTY, SENSEX, CRUDEOIL) replaces it for that name. Buys are limit orders capped by this slippage. Exits are market orders.</p>
-  <div class="table-wrap">
-    <table>
-      <thead><tr><th>Symbol</th><th class="num">Lots</th><th class="num">Min</th><th class="num">Max</th><th>Slippage</th><th></th></tr></thead>
-      <tbody>
-        {% for rule in rules %}
-        <tr>
-          <td>{{ rule.symbol }}</td>
-          <td class="num">{{ rule.lots }}</td>
-          <td class="num">{{ rule.min_lots }}</td>
-          <td class="num">{{ rule.max_lots }}</td>
-          <td>{{ rule.slippage_value }} {{ rule.slippage_mode|lower }}</td>
-          <td>
-            {% if rule.symbol != '*' %}
-            <form method="post" action="/accounts/{{ account.id }}/rules/delete">
-              <input type="hidden" name="csrf" value="{{ csrf }}">
-              <input type="hidden" name="symbol" value="{{ rule.symbol }}">
-              <button class="ghost" type="submit">Remove</button>
-            </form>
-            {% endif %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  <form class="rule-form" method="post" action="/accounts/{{ account.id }}/rules">
-    <input type="hidden" name="csrf" value="{{ csrf }}">
-    <div class="grid">
-      <div class="field"><label for="symbol">Symbol</label><input id="symbol" name="symbol" value="*" required></div>
-      <div class="field"><label for="lots">Lots</label><input id="lots" name="lots" value="2" required></div>
-      <div class="field"><label for="min_lots">Min</label><input id="min_lots" name="min_lots" value="1" required></div>
-      <div class="field"><label for="max_lots">Max</label><input id="max_lots" name="max_lots" value="2" required></div>
-      <div class="field">
-        <label for="slippage_mode">Slippage</label>
-        <select id="slippage_mode" name="slippage_mode">
-          <option value="PERCENT">Percent</option>
-          <option value="POINTS">Points</option>
-        </select>
-      </div>
-      <div class="field"><label for="slippage_value">Slippage value</label><input id="slippage_value" name="slippage_value" value="2.5" required></div>
-    </div>
-    <p class="form-actions"><button type="submit">Save symbol rule</button></p>
-  </form>
-</section>
 {% endblock %}

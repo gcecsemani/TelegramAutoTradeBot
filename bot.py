@@ -20,11 +20,13 @@ import csv
 import json
 import os
 import threading
+import time
 from typing import Optional
 
 import config
 from core import clock
 from core.logging_setup import get
+from core.quote_login import apply_if_changed
 from data.instruments import InstrumentMaster
 from data.kite_gateway import KiteGateway, TokenExpired
 from execution.engine import CopyEngine
@@ -46,6 +48,9 @@ class SignalBot:
         self.trader = PaperTrader(self.gw, self.instruments, self.notify, copy=self.copy_engine.handle)
         self._stop = threading.Event()
         self._monitor: Optional[threading.Thread] = None
+        self._last_catch_up = 0.0
+        self._quote_token = config.ZERODHA_ACCESS_TOKEN
+        self._quotes_down = False
         self.stop_reason = "stopped"
         self.offset = self._load_offset()
 
@@ -139,22 +144,66 @@ class SignalBot:
 
     def _monitor_loop(self) -> None:
         while not self._stop.is_set():
+            if self._quotes_down:
+                if self._take_new_quote_token():
+                    self._quotes_down = False
+                    self.instruments.ensure_loaded()
+                    self.notify("✅ Quote login is saved. Live prices are back.")
+                self._stop.wait(5.0)
+                continue
             busy = False
             try:
+                self._take_new_quote_token()
                 busy = self.trader.tick()
             except TokenExpired:
-                self._token_expired()
-                return
+                self._quotes_paused()
+                continue
             except Exception as exc:
                 log.exception("monitor error: %s", exc)
+            self._catch_up_copies()
             idle = not self.trader.active()
             self._stop.wait(config.ENGINE["monitor_interval_sec"] if busy or idle else 15.0)
 
-    def _token_expired(self) -> None:
-        log.critical("Kite access token expired")
-        self.notify("🚨 <b>Kite login expired.</b> Run <code>python3 login_zerodha.py</code> and restart me. "
-                    "Open trades are saved and resume on restart.")
-        self.stop("Kite login expired")
+    def _catch_up_copies(self) -> None:
+        """A live leg whose signal trade is already closed gets another exit."""
+        now = time.monotonic()
+        if now - self._last_catch_up < 15:
+            return
+        self._last_catch_up = now
+        try:
+            self.copy_engine.catch_up(self.trader.snapshot())
+        except Exception:
+            log.exception("Could not catch up live exits")
+
+    def _take_new_quote_token(self) -> bool:
+        try:
+            fresh = apply_if_changed(self.gw, self._quote_token)
+        except Exception as exc:
+            log.error("Could not read the quote token: %s", exc)
+            return False
+        if fresh == self._quote_token:
+            return False
+        try:
+            ok = self.gw.check_connection()
+        except TokenExpired:
+            self._quote_token = fresh
+            return False
+        if not ok:
+            return False
+        self._quote_token = fresh
+        return True
+
+    def _quotes_paused(self) -> None:
+        if self._take_new_quote_token():
+            self._quotes_down = False
+            return
+        if self._quotes_down:
+            return
+        self._quotes_down = True
+        log.critical("Kite quote token expired")
+        self.notify("🚨 <b>Quote login expired.</b> Open <b>Quote login</b> in the portal, "
+                    "sign in to Zerodha, and paste the redirect URL. I keep reading Telegram "
+                    "and resume prices when that is saved. No restart.")
 
     # ─── Telegram in ──────────────────────────────────────────────────────────
 
@@ -198,7 +247,7 @@ class SignalBot:
             try:
                 self.handle_update(update)
             except TokenExpired:
-                self._token_expired()
+                self._quotes_paused()
             except Exception as exc:
                 log.exception("Could not handle update %s: %s", update.get("update_id"), exc)
             self._save_offset()

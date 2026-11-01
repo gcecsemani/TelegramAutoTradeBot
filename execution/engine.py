@@ -8,8 +8,10 @@ does not stop the others. The intent row is claimed before the broker call.
 If the process dies after the call and before the fill is recorded, recovery
 looks the order up by tag and will not send it again.
 
-Buys are limit + IOC at the account's slippage cap, so a late copy does not
-chase. When that buy fills, a sell stop-market rests at the broker at the
+Buys are limit + IOC at the admin slippage cap, so a late copy does not
+chase. Lot size is the account cash divided by the admin rupee amount.
+Cash already in a position is not subtracted, so one trade does not shrink
+the next. When that buy fills, a sell stop-market rests at the broker at the
 signal stop (or the 30% default). A later stop message modifies it. An exit
 cancels that stop first, and does not sell again when the stop has already filled.
 """
@@ -30,13 +32,17 @@ from core.crypto import decrypt
 from core.logging_setup import get
 from execution import store
 from execution.events import CopyEvent
-from execution.risk import plan_buy, round_tick, sell_lots
+from execution.risk import lots_for_balance, plan_buy, round_tick, sell_lots
 
 log = get("copy")
 
 Notify = Callable[[str], None]
 _OPEN = {"NEW", "SENDING", "UNKNOWN", "WORKING", "WAITING", "AUTH"}
 _TERMINAL_BUY_FAIL = {"MISSED", "FAILED", "REJECTED", "SKIPPED"}
+# A lost reply is not proof the order is absent. Look it up before any retry.
+_LOOKUP_GRACE_SEC = 20
+_EXIT_RETRY_SEC = 3
+_STOP_RETRY_SEC = 15
 
 
 @dataclass
@@ -61,6 +67,15 @@ def build_broker(account: dict):
             decrypt(account.get("api_key_enc") or ""),
             decrypt(account.get("api_secret_enc") or ""),
             decrypt(account.get("access_token_enc") or ""),
+        )
+    if account.get("broker") == "kotak":
+        from brokers.kotak import KotakBroker
+        return KotakBroker(
+            decrypt(account.get("api_key_enc") or ""),
+            decrypt(account.get("api_secret_enc") or ""),
+            decrypt(account.get("access_token_enc") or ""),
+            account.get("client_id") or "",
+            account.get("mobile") or "",
         )
     from brokers.stub import UnavailableBroker
     return UnavailableBroker(label(account.get("broker") or "broker"))
@@ -153,6 +168,7 @@ class CopyEngine:
                 self._reconcile_one(intent)
             except Exception:
                 log.exception("Could not reconcile intent %s", intent.get("id"))
+        self._rearm_failed_stops()
 
     def flatten_account(self, account_id: int) -> int:
         """Market-sell every open leg on this account. Returns how many were sent."""
@@ -192,27 +208,41 @@ class CopyEngine:
     def _buy(self, account: dict, event: CopyEvent) -> Result:
         name = self._name(account)
         reason = buy_block_reason(account)
-        rule = store.effective_rule(account["id"], event.symbol)
+        skip_status = "SKIPPED"
         plan = None
         if not reason:
-            plan = plan_buy(
-                lots=int(rule["lots"]),
-                min_lots=int(rule["min_lots"]),
-                max_lots=int(rule["max_lots"]),
-                slippage_mode="POINTS" if event.exact else rule["slippage_mode"],
-                slippage_value=0.0 if event.exact else float(rule["slippage_value"]),
-                price=event.price,
-                sl=event.sl,
-                tick=event.tick_size,
-                multiplier=event.multiplier,
-                lot_size=event.lot_size,
-                max_loss_trade=_num(account.get("max_loss_trade")),
-                max_loss_day=_num(account.get("max_loss_day")),
-                day_realized=store.day_realized(account["id"]),
-                default_sl_pct=float(config.TRADE["default_sl_pct"]),
-            )
-            if not plan.ok:
-                reason = plan.reason
+            try:
+                balance = self._cash_balance(account, event.exchange)
+            except TokenError:
+                reason = "login required"
+                skip_status = "AUTH"
+            except (BrokerError, TransientError, TypeError, ValueError) as exc:
+                reason = f"could not read the account balance ({exc})"
+            else:
+                per = store.rupees_per_lot(event.symbol)
+                sized = lots_for_balance(balance, per)
+                if sized < 1:
+                    reason = f"balance {_inr(balance)} is below {_inr(per)} for 1 {event.symbol or 'symbol'} lot"
+                else:
+                    slip = store.effective_slippage(event.symbol)
+                    plan = plan_buy(
+                        lots=sized,
+                        min_lots=1,
+                        max_lots=sized,
+                        slippage_mode="POINTS" if event.exact else slip["slippage_mode"],
+                        slippage_value=0.0 if event.exact else float(slip["slippage_value"]),
+                        price=event.price,
+                        sl=event.sl,
+                        tick=event.tick_size,
+                        multiplier=event.multiplier,
+                        lot_size=event.lot_size,
+                        max_loss_trade=_num(account.get("max_loss_trade")),
+                        max_loss_day=_num(account.get("max_loss_day")),
+                        day_realized=store.day_realized(account["id"]),
+                        default_sl_pct=float(config.TRADE["default_sl_pct"]),
+                    )
+                    if not plan.ok:
+                        reason = plan.reason
         key = f"{event.position_id}:{account['id']}:BUY"
         row = _intent_row(key, account, event, "BUY", plan.lots if plan and plan.ok else 0,
                           plan.quantity if plan and plan.ok else 0,
@@ -222,9 +252,20 @@ class CopyEngine:
             return Result(name, "DONE", "already handled", notify=False)
         intent = store.intent_by_key(key)
         if reason:
-            store.update_intent(intent["id"], status="SKIPPED", reason=reason)
-            return Result(name, "SKIPPED", reason)
+            store.update_intent(intent["id"], status=skip_status, reason=reason)
+            return Result(name, skip_status, reason)
         return self._send(account, intent, "BUY")
+
+    def _cash_balance(self, account: dict, exchange: str) -> float:
+        """Paper uses the saved balance. Live reads broker cash and does not
+        subtract margin already in a position."""
+        if account.get("mode") != "live":
+            return max(0.0, float(account.get("paper_balance") or 0))
+        broker = self.broker_factory(account)
+        reader = getattr(broker, "cash_balance", None)
+        if reader is None:
+            raise BrokerError("this broker does not report a balance")
+        return float(reader(exchange))
 
     def _sell(self, account: dict, event: CopyEvent, recover_key: str = "") -> Result:
         name = self._name(account)
@@ -241,10 +282,12 @@ class CopyEngine:
             return Result(name, "SKIPPED", "nothing open on this account", notify=False)
         pulled = self._pull_stop(account, leg)
         leg = store.get_leg(account["id"], event.position_id) or leg
-        if pulled == "unknown":
-            return Result(name, "WAITING", "stop order was not confirmed, so the exit was not sent")
-        if pulled == "working":
-            return Result(name, "WAITING", "the stop is still working, so no second sell was sent")
+        if pulled in ("unknown", "working"):
+            self._defer_exit(account, event, pulled)
+            detail = ("stop order was not confirmed, so the exit was not sent"
+                      if pulled == "unknown" else
+                      "the stop is still working, so no second sell was sent")
+            return Result(name, "WAITING", detail)
         if leg is None or int(leg["lots_open"]) <= 0:
             if pulled == "filled":
                 return Result(name, "FILLED", "stop already closed this account")
@@ -263,6 +306,26 @@ class CopyEngine:
             return Result(name, "DONE", "already handled", notify=False)
         intent = store.intent_by_key(key)
         return self._send(account, intent, "SELL")
+
+    def _defer_exit(self, account: dict, event: CopyEvent, pulled: str) -> None:
+        """Remember an exit the stop blocked, so recovery keeps trying it."""
+        reason = "STOP UNCONFIRMED" if pulled == "unknown" else "STOP WORKING"
+        key = f"{event.position_id}:{account['id']}:SELL:WAIT"
+        row = _intent_row(key, account, event, "SELL", event.lots, 0, 0.0, "MARKET", reason)
+        row["status"] = "WAITING"
+        if store.claim_intent(row):
+            self.notify(
+                f"⏳ Exit waiting · {_esc(self._name(account))} · {_esc(event.tradingsymbol)}\n"
+                "The stop is not confirmed yet, so no market sell was sent. I will keep trying."
+            )
+            return
+        existing = store.intent_by_key(key)
+        if existing is None or existing["status"] in ("SENDING", "UNKNOWN", "WORKING", "NEW"):
+            return
+        if existing["status"] != "WAITING":
+            store.update_intent(existing["id"], status="WAITING", reason=reason)
+        else:
+            store.update_intent(existing["id"], reason=reason)
 
     def _send(self, account: dict, intent: dict, side: str) -> Result:
         name = self._name(account)
@@ -300,12 +363,24 @@ class CopyEngine:
             "filled_qty": view.filled_quantity,
             "last_error": view.message,
         }
-        if side == "SL" and view.status == "COMPLETE" and view.filled_quantity > 0:
+        if side == "SL" and view.filled_quantity > 0 and view.status in ("COMPLETE", "CANCELLED"):
             return self._book_stop_fill(account, intent, view)
         if side == "SL" and view.status == "OPEN":
             self._remember_stop(account, intent, view)
             return Result(name, "WORKING", "stop is working", notify=False)
-        if view.status == "COMPLETE" and view.filled_quantity > 0:
+        if side == "SL" and view.status == "UNKNOWN":
+            store.update_intent(
+                intent["id"], status="UNKNOWN",
+                broker_order_id=view.order_id or intent.get("broker_order_id") or "",
+                last_error=view.message,
+            )
+            store.set_leg_stop(
+                account["id"], intent["position_id"], view.order_id or "",
+                float(intent.get("limit_price") or 0), int(intent.get("quantity") or 0),
+                intent.get("tag") or "", "UNKNOWN",
+            )
+            return Result(name, "UNKNOWN", "stop placed; status not confirmed", notify=False)
+        if view.filled_quantity > 0 and view.status in ("COMPLETE", "CANCELLED"):
             price = view.average_price or float(intent["limit_price"] or 0)
             if price <= 0 and side == "SELL":
                 leg = store.get_leg(account["id"], intent["position_id"])
@@ -340,6 +415,13 @@ class CopyEngine:
             status = "MISSED" if side == "BUY" and view.status == "CANCELLED" else "REJECTED"
             reason = view.message or ("outside the slippage limit" if status == "MISSED" else "rejected")
             store.update_intent(intent["id"], status=status, reason=reason, **fields)
+            if side == "SL":
+                leg = store.get_leg(account["id"], intent["position_id"])
+                if leg and leg.get("sl_status") in ("WORKING", "UNKNOWN", "FAILED"):
+                    store.set_leg_stop(
+                        account["id"], intent["position_id"], "", float(leg.get("sl_trigger") or 0),
+                        0, intent.get("tag") or "", "FAILED",
+                    )
             if side == "SELL":
                 self._rearm_open(account, intent["position_id"])
             return Result(name, status, reason)
@@ -395,7 +477,8 @@ class CopyEngine:
             return Result(name, "WORKING", f"stop {trigger:,.2f}")
         return Result(name, "REJECTED", "stop was not placed")
 
-    def _arm_stop(self, account: dict, intent: dict, trigger: float, quantity: int) -> None:
+    def _arm_stop(self, account: dict, intent: dict, trigger: float, quantity: int,
+                  announce: bool = True) -> None:
         if trigger <= 0 or quantity <= 0:
             return
         leg = store.get_leg(account["id"], intent["position_id"])
@@ -446,7 +529,8 @@ class CopyEngine:
         except BrokerError as exc:
             store.update_intent(claimed["id"], status="REJECTED", last_error=str(exc), reason=str(exc))
             store.set_leg_stop(account["id"], intent["position_id"], "", trigger, 0, claimed["tag"], "FAILED")
-            self.notify(f"⚠️ Stop rejected · {_esc(self._name(account))} · {_esc(leg['tradingsymbol'])}\n{ _esc(str(exc))}")
+            if announce:
+                self.notify(f"⚠️ Stop rejected · {_esc(self._name(account))} · {_esc(leg['tradingsymbol'])}\n{ _esc(str(exc))}")
             return
         except TransientError as exc:
             store.update_intent(claimed["id"], status="UNKNOWN", last_error=str(exc))
@@ -456,12 +540,23 @@ class CopyEngine:
         if view.status == "COMPLETE" and view.filled_quantity > 0:
             self._book_stop_fill(account, store.intent_by_key(key) or claimed, view)
             return
-        if view.status in ("REJECTED", "CANCELLED"):
+        if view.status in ("REJECTED", "CANCELLED") and view.filled_quantity <= 0:
             store.update_intent(claimed["id"], status="REJECTED", reason=view.message or "stop rejected",
                                 broker_order_id=view.order_id, last_error=view.message)
             store.set_leg_stop(account["id"], intent["position_id"], "", trigger, 0, claimed["tag"], "FAILED")
-            self.notify(f"⚠️ Stop rejected · {_esc(self._name(account))} · {_esc(leg['tradingsymbol'])}\n"
-                        f"{_esc(view.message or 'rejected')}")
+            if announce:
+                self.notify(f"⚠️ Stop rejected · {_esc(self._name(account))} · {_esc(leg['tradingsymbol'])}\n"
+                            f"{_esc(view.message or 'rejected')}")
+            return
+        if view.status == "UNKNOWN":
+            store.update_intent(claimed["id"], status="UNKNOWN", broker_order_id=view.order_id, last_error=view.message)
+            store.set_leg_stop(
+                account["id"], intent["position_id"], view.order_id or "", trigger, quantity,
+                claimed["tag"], "UNKNOWN",
+            )
+            return
+        if view.status == "CANCELLED" and view.filled_quantity > 0:
+            self._book_stop_fill(account, store.intent_by_key(key) or claimed, view)
             return
         self._remember_stop(account, store.intent_by_key(key) or claimed, view)
 
@@ -497,6 +592,17 @@ class CopyEngine:
         trigger = float(leg.get("sl_trigger") or 0)
         order_id = leg.get("sl_order_id") or ""
         broker = self.broker_factory(account)
+        if not order_id and leg.get("sl_tag") and hasattr(broker, "find_by_tag"):
+            try:
+                found = broker.find_by_tag(leg["sl_tag"])
+            except (TransientError, BrokerError, TokenError):
+                return "unknown"
+            if found is None:
+                store.set_leg_stop(account["id"], leg["position_id"], "", trigger, 0, "", "")
+                return "clear"
+            order_id = found.order_id or ""
+            if not order_id:
+                return "unknown"
         view = None
         try:
             if order_id and hasattr(broker, "cancel"):
@@ -601,76 +707,217 @@ class CopyEngine:
             fresh = store.intent_by_id(intent["id"]) or intent
             if fresh["status"] not in _OPEN:
                 return
-            if fresh["status"] == "AUTH" and account.get("token_date") != clock.today().isoformat():
+            if fresh["status"] == "NEW" and int(fresh.get("attempts") or 0) == 0:
+                self._send(account, fresh, fresh["action"])
                 return
+            if fresh["status"] == "AUTH":
+                logged_in = account.get("mode") != "live" or account.get("token_date") == clock.today().isoformat()
+                if not logged_in:
+                    return
+                if not (fresh.get("broker_order_id") or "") and int(fresh.get("attempts") or 0) < 3 and age >= 15:
+                    self._send(account, fresh, fresh["action"])
+                    return
             self._resolve_broker_state(account, fresh)
 
     def _release_waiting(self, account: dict, intent: dict) -> None:
-        buy = store.buy_intent(account["id"], intent["position_id"])
-        leg = store.get_leg(account["id"], intent["position_id"])
-        if buy and buy["status"] in _OPEN:
+        if _age(intent.get("updated_at") or "") < _EXIT_RETRY_SEC:
             return
-        if buy and buy["status"] in _TERMINAL_BUY_FAIL:
-            store.update_intent(intent["id"], status="SKIPPED", reason="entry did not fill")
-            return
-        if leg is None or int(leg["lots_open"]) <= 0:
-            store.update_intent(intent["id"], status="SKIPPED", reason="nothing open")
-            return
-        store.update_intent(intent["id"], status="SKIPPED", reason="replaced by the exit")
-        event = CopyEvent(
-            action="SELL", position_id=intent["position_id"], symbol=intent["symbol"],
-            exchange=leg["exchange"], tradingsymbol=leg["tradingsymbol"],
-            tick_size=0.05, multiplier=int(leg["multiplier"]), lot_size=0,
-            lots=int(leg["lots_open"]), lots_before=int(leg["lots_open"]),
-            price=0.0, sl=None, reason=intent.get("reason") or "EXIT", signal_ref="",
-        )
         with self._account_lock(account["id"]):
-            self._sell(account, event, recover_key="AFTER-ENTRY")
+            fresh = store.intent_by_id(intent["id"]) or intent
+            if fresh["status"] != "WAITING":
+                return
+            if _age(fresh.get("updated_at") or "") < _EXIT_RETRY_SEC:
+                return
+            buy = store.buy_intent(account["id"], intent["position_id"])
+            leg = store.get_leg(account["id"], intent["position_id"])
+            if buy and buy["status"] in _OPEN:
+                return
+            if buy and buy["status"] in _TERMINAL_BUY_FAIL:
+                store.update_intent(fresh["id"], status="SKIPPED", reason="entry did not fill")
+                return
+            if leg is None or int(leg["lots_open"]) <= 0:
+                store.update_intent(fresh["id"], status="SKIPPED", reason="nothing open")
+                return
+            why = fresh.get("reason") or "EXIT"
+            if str(why).startswith("STOP"):
+                why = "EXIT"
+            store.update_intent(fresh["id"], status="WAITING", reason=why)
+            event = CopyEvent(
+                action="SELL", position_id=intent["position_id"], symbol=intent["symbol"],
+                exchange=leg["exchange"], tradingsymbol=leg["tradingsymbol"],
+                tick_size=0.05, multiplier=int(leg["multiplier"]), lot_size=0,
+                lots=int(leg["lots_open"]), lots_before=int(leg["lots_open"]),
+                price=0.0, sl=None, reason=why, signal_ref="",
+            )
+            result = self._sell(account, event, recover_key="AFTER-ENTRY")
+            current = store.intent_by_id(fresh["id"])
+            if result.status != "WAITING" and current and current["status"] == "WAITING":
+                store.update_intent(fresh["id"], status="SKIPPED", reason="exit handed off")
 
     def _resolve_broker_state(self, account: dict, intent: dict) -> None:
+        """Look the order up. A missing reply is not a reason to send it again,
+        except one sell retry once the order book has had time to show it."""
+        view = None
+        lookup_failed = False
         try:
             broker = self.broker_factory(account)
-            view = None
-            if intent.get("broker_order_id"):
+            if intent.get("broker_order_id") and hasattr(broker, "fetch"):
                 view = broker.fetch(intent["broker_order_id"])
-            if view is None or view.status == "UNKNOWN":
-                view = broker.find_by_tag(intent["tag"]) or view
+            if (view is None or view.status == "UNKNOWN") and hasattr(broker, "find_by_tag"):
+                found = broker.find_by_tag(intent["tag"])
+                if found is not None:
+                    view = found
         except TokenError as exc:
+            already = intent.get("status") == "AUTH"
             store.update_intent(intent["id"], status="AUTH", last_error=str(exc))
+            if not already:
+                self.notify(
+                    f"⚠️ Login required · {_esc(self._name(account))} · {_esc(intent.get('tradingsymbol') or '')}\n"
+                    "The order was sent. Log in on the portal so I can confirm it."
+                )
             return
-        except TransientError:
-            return
-        except BrokerError as exc:
-            store.update_intent(intent["id"], status="REJECTED", last_error=str(exc), reason=str(exc))
-            return
+        except (TransientError, BrokerError):
+            lookup_failed = True
         if view is not None and view.status != "UNKNOWN":
             self._apply(account, intent, view, intent["action"])
             return
-        attempts = int(intent["attempts"])
-        if attempts >= 3:
-            store.update_intent(intent["id"], status="FAILED", reason="gave up after 3 tries")
-            self.notify(f"⚠️ Copy failed · {_esc(self._name(account))} · {_esc(intent['tradingsymbol'])}\n"
-                        "No matching broker order after 3 tries. Check the portal.")
+        if lookup_failed:
             return
-        fresh = dict(intent)
-        fresh["attempts"] = attempts
-        self._send(account, fresh, intent["action"])
+        if _age(intent.get("updated_at") or intent.get("created_at") or "") < _LOOKUP_GRACE_SEC:
+            return
+        action = intent.get("action") or ""
+        attempts = int(intent.get("attempts") or 0)
+        if action == "SELL" and attempts < 2:
+            fresh = dict(intent)
+            fresh["attempts"] = attempts
+            self._send(account, fresh, "SELL")
+            return
+        if action == "SL" and not (intent.get("broker_order_id") or ""):
+            self._give_up_missing_stop(account, intent)
+            return
+        self._alert_unconfirmed(account, intent)
+
+    def _alert_unconfirmed(self, account: dict, intent: dict) -> None:
+        if intent.get("reason") == "UNCONFIRMED":
+            return
+        store.update_intent(intent["id"], status="UNKNOWN", reason="UNCONFIRMED",
+                            last_error="no matching broker order yet")
+        self.notify(
+            f"⚠️ Order not confirmed · {_esc(self._name(account))} · {_esc(intent.get('tradingsymbol') or '')}\n"
+            f"No matching {intent.get('action') or 'order'} in the order book. "
+            "A second copy was not sent. I will keep checking."
+        )
+
+    def _give_up_missing_stop(self, account: dict, intent: dict) -> None:
+        """The stop request left no order. Mark it failed so a fresh stop can be placed."""
+        store.update_intent(intent["id"], status="REJECTED", reason="stop was not accepted",
+                            last_error="no matching stop order")
+        leg = store.get_leg(account["id"], intent["position_id"])
+        if leg is None or int(leg["lots_open"]) <= 0:
+            return
+        if leg.get("sl_status") not in ("UNKNOWN", "WORKING"):
+            return
+        trigger = float(intent.get("limit_price") or leg.get("sl_trigger") or 0)
+        if trigger <= 0:
+            return
+        store.set_leg_stop(account["id"], intent["position_id"], "", trigger, 0, "", "FAILED")
+
+    def _rearm_failed_stops(self) -> None:
+        try:
+            legs = store.open_legs()
+        except Exception:
+            log.exception("Could not read open legs")
+            return
+        for leg in legs:
+            if leg.get("sl_status") != "FAILED" or float(leg.get("sl_trigger") or 0) <= 0:
+                continue
+            rejected = store.count_action_status(leg["account_id"], leg["position_id"], "SL", "REJECTED")
+            if rejected >= 3:
+                latest = store.latest_action(leg["account_id"], leg["position_id"], "SL")
+                if latest and latest.get("last_error") != "STOP GAVE UP":
+                    store.update_intent(latest["id"], last_error="STOP GAVE UP")
+                    self.notify(
+                        f"⚠️ Stop rejected 3 times · {_esc(leg.get('tradingsymbol') or '')}\n"
+                        "This account is open with no broker stop. Exit it from the signal if you want it closed."
+                    )
+                continue
+            if _age(leg.get("updated_at") or "") < _STOP_RETRY_SEC:
+                continue
+            account = store.get_account(leg["account_id"])
+            if account is None or buy_block_reason(account):
+                continue
+            try:
+                with self._account_lock(account["id"]):
+                    fresh = store.get_leg(account["id"], leg["position_id"])
+                    if fresh is None or fresh.get("sl_status") != "FAILED":
+                        continue
+                    self._arm_stop(account, {
+                        "position_id": leg["position_id"], "symbol": "", "exchange": fresh["exchange"],
+                        "tradingsymbol": fresh["tradingsymbol"], "product": fresh["product"],
+                        "multiplier": fresh["multiplier"],
+                    }, float(fresh["sl_trigger"]), int(fresh["quantity_open"]), announce=False)
+                    kept = store.get_leg(account["id"], leg["position_id"]) or {}
+                    if kept.get("sl_status") == "WORKING":
+                        self.notify(
+                            f"✅ Stop is working · {_esc(self._name(account))} · {_esc(fresh['tradingsymbol'])}\n"
+                            f"{float(kept.get('sl_trigger') or 0):,.2f}"
+                        )
+            except Exception:
+                log.exception("Could not replace a rejected stop for %s", leg.get("tradingsymbol"))
+
+    def catch_up(self, positions) -> None:
+        """Sell a live leg whose signal trade is already closed, when no exit is in flight."""
+        try:
+            accounts = store.copy_accounts()
+        except Exception:
+            log.exception("Could not read copy accounts")
+            return
+        if not accounts:
+            return
+        for pos in positions:
+            if getattr(pos, "status", "") in ("OPEN", "PENDING"):
+                continue
+            for account in accounts:
+                self._catch_one(account, pos)
+
+    def _catch_one(self, account: dict, pos) -> None:
+        leg = store.get_leg(account["id"], pos.id)
+        if leg is None or int(leg["lots_open"]) <= 0:
+            return
+        inflight = store.active_sell(account["id"], pos.id)
+        if inflight:
+            stale = (inflight["status"] == "UNKNOWN" and inflight.get("reason") == "UNCONFIRMED"
+                     and _age(inflight.get("updated_at") or "") >= _LOOKUP_GRACE_SEC)
+            if not stale:
+                return
+            store.update_intent(inflight["id"], status="FAILED", reason="order book never showed it")
+            self.notify(
+                f"⚠️ Exit never showed at the broker · {_esc(self._name(account))} · {_esc(pos.tradingsymbol)}\n"
+                "Sending it again."
+            )
+        result = self._safe(
+            account,
+            _event_from_position(pos, "SELL", int(leg["lots_open"]), int(leg["lots_open"]), "RECOVERY"),
+        )
+        if result.notify:
+            self.notify(
+                f"<b>Copy SELL</b> · {_esc(pos.tradingsymbol)} · recovery\n"
+                f"• {_esc(result.label)} · {result.status} · {_esc(result.detail)}"
+            )
 
     def _recover_book(self, positions: list) -> None:
         accounts = store.copy_accounts()
         if not accounts:
             return
-        now = clock.now()
         for pos in positions:
             status = getattr(pos, "status", "")
             age = _age(getattr(pos, "entry_time", "") or getattr(pos, "created_at", ""))
+            if status != "OPEN" or age > 180:
+                continue
             for account in accounts:
-                if status == "OPEN" and age <= 180 and not store.buy_intent(account["id"], pos.id):
+                if not store.buy_intent(account["id"], pos.id):
                     self._safe(account, _event_from_position(pos, "BUY", pos.lots, pos.lots, "RECOVERY"))
-                leg = store.get_leg(account["id"], pos.id)
-                master_open = pos.lots if status == "OPEN" else 0
-                if leg and int(leg["lots_open"]) > 0 and master_open <= 0 and not store.active_sell(account["id"], pos.id):
-                    self._safe(account, _event_from_position(pos, "SELL", int(leg["lots_open"]), int(leg["lots_open"]), "RECOVERY"))
+        self.catch_up(positions)
 
     def _report(self, event: CopyEvent, results: List[Result]) -> None:
         shown = [item for item in results if item.notify]
@@ -731,6 +978,10 @@ def _event_from_position(pos, action: str, lots: int, lots_before: int, reason: 
         sl=pos.sl, reason=reason, signal_ref=pos.signal_ref,
         exact=getattr(pos, "mode", "") == "ONLY",
     )
+
+
+def _inr(amount: float) -> str:
+    return f"₹{float(amount):,.0f}"
 
 
 def _num(value) -> Optional[float]:

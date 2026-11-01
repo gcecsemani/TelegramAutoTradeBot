@@ -5,7 +5,24 @@
   <p class="kicker">{{ account.broker_label }}</p>
   <h1>Daily login</h1>
   <p class="lede">{{ account.label }}</p>
-  {% if account.broker != 'zerodha' %}
+  {% if account.broker == 'kotak' %}
+    <p>Kotak Neo needs a fresh authenticator code every morning. The Trade API token, UCC and MPIN are already saved. Enter the 6-digit code from the authenticator app.</p>
+    <form method="post" action="/accounts/{{ account.id }}/auth">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <div class="field">
+        <label for="mobile">Mobile number</label>
+        <input id="mobile" name="mobile" value="{{ account.mobile or '' }}" placeholder="+919876543210" autocomplete="tel" required>
+      </div>
+      <div class="field">
+        <label for="totp">Authenticator code</label>
+        <input id="totp" name="totp" inputmode="numeric" autocomplete="one-time-code" required>
+      </div>
+      <p class="form-actions"><button type="submit">Save today's session</button></p>
+    </form>
+    <p class="{{ 'ok' if account.token_today else 'warn' }}">
+      {% if account.token_today %}Session on file is from today ({{ account.token_date }}).{% else %}No session for today yet.{% endif %}
+    </p>
+  {% elif account.broker != 'zerodha' %}
     <p>{{ account.broker_label }} cannot renew a token yet. The key is saved for when that broker is connected.</p>
   {% else %}
     <p>Zerodha access tokens die every morning. Open the login link, sign in, and paste the full redirect URL from the address bar. The page at <code>127.0.0.1</code> does not need to load.</p>

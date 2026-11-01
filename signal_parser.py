@@ -10,6 +10,7 @@ BUY CALL (its own message)
     Buy Near 90        buy at any price up to 2.5% over 90
     Buy Near 100-105   buy at 105 or below (inside the range, or under it)
     Buy only 100       buy only when the ask is 100, with no band
+    Buy.100 · Buy. 100 same exact-price buy
     Buy CMP            buy at the current price
     Book near 130      once open, sell everything at 130 or above
     Book 50 near 130   once open, sell 50% at 130 or above
@@ -30,7 +31,6 @@ FOLLOW-UP (a reply that tags the call, or the bot's message about it)
 
     SL 70                                   SL to 70
     SL to cost · SL at cost · SL at CTC · SL CTC      SL to the entry price
-    SL to t1 · SL to t2 · SL to t3          SL to that target
     No sl · Hero zero · Hero to Zero        no SL
     Exit · Book · Book full · Book fully · Ignore · Avoid · Cancel · Close · Sell · SL hit
                                             exit every lot (or drop a call still waiting)
@@ -65,7 +65,11 @@ BUY_RANGE_RE = re.compile(
     r"\bBUY\s*[:\-@]?\s*NEAR\s*[:\-@]?\s*(" + NUM + r")\s*-\s*(" + NUM + r")" + _END
 )
 BUY_ONLY_RE = re.compile(
-    r"\bBUY\s*[:\-@]?\s*(?:ONLY\s*[:\-@]?\s*(" + NUM + r")" + _END + r"|(" + NUM + r")\s*ONLY\b)"
+    r"\bBUY\s*[:\-@]?\s*(?:"
+    r"ONLY\s*[:\-@]?\s*(" + NUM + r")" + _END +
+    r"|(" + NUM + r")\s*ONLY\b" +
+    r"|\.\s*(" + NUM + r")" + _END +
+    r")"
 )
 BUY_RE = re.compile(r"\bBUY\s*[:\-@]?\s*(?:(ABOVE|NEAR)\s*[:\-@]?\s*(" + NUM + r")" + _END + r"|(CMP)\b)")
 BOOK_AT_RE = re.compile(
@@ -79,7 +83,6 @@ SELL_RE = re.compile(r"\b(?:SELL|SHORT|WRITE)\b")
 
 SL_PRICE_RE = re.compile(r"\bSL\s*(?:TO|AT|@|:|-|=)?\s*(" + NUM + r")" + _END)
 SL_COST_RE = re.compile(r"\bSL\s*(?:TO|AT|@|:|-|=)?\s*(?:COST|CTC)\b")
-SL_TARGET_RE = re.compile(r"\bSL\s*(?:TO|AT|@|:|-|=)?\s*T(?:GT|ARGET)?\s*-?\s*([1-9])\b")
 NO_SL_RE = re.compile(r"\bNO\s*SL\b|\bHERO\s*(?:TO\s*)?ZERO\b")
 TARGET_RE = re.compile(r"\b(?:TGT|TARGET)S?\s*[:\-=]?\s*(" + NUM + r"(?:\s*[/,\-]?\s*" + NUM + r")*)")
 
@@ -157,8 +160,8 @@ class FollowUp:
     exit: str = ""                       # "" / FULL / HALF
     book_level: Optional[float] = None   # Book near 130, once the price is there
     book_pct: float = 100.0
-    sl: str = ""                         # "" / PRICE / COST / TARGET / NONE
-    sl_value: float = 0.0                # the price, or the target number
+    sl: str = ""                         # "" / PRICE / COST / NONE
+    sl_value: float = 0.0                # the price
     targets: List[float] = field(default_factory=list)
 
 
@@ -178,19 +181,34 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
+_SKIP_WORDS = {"BUY", "SELL", "ABOVE", "NEAR", "CMP", "SL", "TGT", "TARGET", "ONLY", "AT", "TO"}
+
+
+def _lookup_symbol(span: str) -> Optional[str]:
+    for name, cfg in config.SYMBOLS.items():
+        if any(re.fullmatch(alias, span) for alias in cfg["aliases"]):
+            return name
+    return _STOCKS.get(re.sub(r"[^A-Z0-9]", "", span))
+
+
 def _symbol_before(text: str, start: int) -> Optional[str]:
-    """The instrument named by the 1–3 words right before the strike."""
+    """The instrument named by the 1–3 words right before the strike.
+
+    A longer unknown name is not shortened. "BANK NIFTY" stays unmatched
+    when BANKNIFTY is not loaded, instead of becoming NIFTY.
+    """
     words = list(WORD_RE.finditer(text[:start]))
+    while len(words) > 1 and words[0].group(0) in _SKIP_WORDS:
+        words = words[1:]
     for n in (3, 2, 1):
         if len(words) < n:
             continue
         span = text[words[-n].start():words[-1].end()]
-        for name, cfg in config.SYMBOLS.items():
-            if any(re.fullmatch(alias, span) for alias in cfg["aliases"]):
-                return name
-        name = _STOCKS.get(re.sub(r"[^A-Z0-9]", "", span))
-        if name:
-            return name
+        found = _lookup_symbol(span)
+        if found:
+            return found
+        if n > 1 and words[-n].group(0) not in _SKIP_WORDS:
+            return None
     return None
 
 
@@ -216,7 +234,7 @@ def parse_call(t: str) -> Tuple[Optional[BuyCall], str]:
     if error:
         return None, error
     if found is None:
-        return None, "Write the entry as Buy Above 100, Buy Near 90, Buy Near 100-105, Buy only 100 or Buy CMP."
+        return None, "Write the entry as Buy Above 100, Buy Near 90, Buy Near 100-105, Buy only 100, Buy.100 or Buy CMP."
     mode, level, level_high, buy = found
     call = BuyCall(symbol=symbol, strike=float(contract.group(1)),
                    opt_type="CE" if contract.group(2).startswith("C") else "PE",
@@ -240,14 +258,14 @@ def _read_entry(t: str):
         return ("RANGE", low, high, rng), ""
     only = BUY_ONLY_RE.search(t)
     if only:
-        level = float(only.group(1) or only.group(2))
+        level = float(only.group(1) or only.group(2) or only.group(3))
         if level <= 0:
             return None, "The buy level must be above 0."
         return ("ONLY", level, None, only), ""
     buy = BUY_RE.search(t)
     if buy is None:
         if _INCOMPLETE_ENTRY_RE.search(t) or _BARE_BUY_PRICE_RE.search(t) or re.search(r"\bBUY\s*[:\-@]?\s*ONLY\b", t):
-            return None, "Write the entry as Buy Above 100, Buy Near 90, Buy Near 100-105, Buy only 100 or Buy CMP."
+            return None, "Write the entry as Buy Above 100, Buy Near 90, Buy Near 100-105, Buy only 100, Buy.100 or Buy CMP."
         return None, ""
     level = float(buy.group(2)) if buy.group(2) else None
     if level is not None and level <= 0:
@@ -335,12 +353,9 @@ def parse_follow_up(t: str) -> Tuple[Optional[FollowUp], str]:
         if EXIT_RE.search(t):
             return FollowUp(exit="FULL"), ""
     fu = FollowUp(targets=_targets(t))
-    target_no = SL_TARGET_RE.search(t)
     price = SL_PRICE_RE.search(t)
     if NO_SL_RE.search(t):
         fu.sl = "NONE"
-    elif target_no:
-        fu.sl, fu.sl_value = "TARGET", float(target_no.group(1))
     elif SL_COST_RE.search(t):
         fu.sl = "COST"
     elif price:

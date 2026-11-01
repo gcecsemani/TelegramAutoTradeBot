@@ -56,7 +56,8 @@ class PortalTests(unittest.TestCase):
         self.assertNotIn('value="key"', saved.text)
 
         account = self.client.get("/accounts/1")
-        self.assertIn("Lots and slippage", account.text)
+        self.assertIn("Paper balance", account.text)
+        self.assertNotIn("Save symbol rule", account.text)
         blocked = self.client.post("/accounts/1", data={
             "csrf": _csrf(account.text), "label": "Main", "broker": "zerodha",
             "product": "MIS", "mode": "live", "enabled": "1", "auto_kill": "1",
@@ -79,15 +80,62 @@ class PortalTests(unittest.TestCase):
         self.assertIn("Ada desk", ada)
         self.assertNotIn("Ben desk", ada)
         hidden = self.client.get("/accounts/2", follow_redirects=True)
-        self.assertNotIn("Lots and slippage", hidden.text)
+        self.assertNotIn("Paper balance", hidden.text)
 
         admin = self._login("admin@cca.com", "admin")
         self.assertIn("Ada desk", admin)
         self.assertIn("Ben desk", admin)
         self.assertIn("admin@cca.com", admin)
         opened = self.client.get("/accounts/2")
-        self.assertIn("Lots and slippage", opened.text)
+        self.assertIn("Paper balance", opened.text)
+        self.assertNotIn("Save symbol rule", opened.text)
+        self.assertIn("Quote login", self.client.get("/dashboard").text)
+        quote = self.client.get("/quote")
+        self.assertIn("Save today's quote token", quote.text)
+        config_page = self.client.get("/config")
+        self.assertIn("Rupees for one lot", config_page.text)
+        self.assertIn("BANKNIFTY", config_page.text)
+        saved = self.client.post("/config/margin", data={
+            "csrf": _csrf(config_page.text), "symbol": "CRUDEOIL", "rupees_per_lot": "150000",
+        }, follow_redirects=True)
+        self.assertIn("CRUDEOIL", saved.text)
+        self.assertIn("150,000", saved.text)
+        slipped = self.client.post("/config/slippage", data={
+            "csrf": _csrf(saved.text), "symbol": "NIFTY", "slippage_mode": "POINTS", "slippage_value": "1.5",
+        }, follow_redirects=True)
+        self.assertIn("1.5 points", slipped.text)
+        kept = self.client.post("/config/margin/delete", data={
+            "csrf": _csrf(slipped.text), "symbol": "*",
+        }, follow_redirects=True)
+        self.assertIn("default row stays", kept.text)
+        self._login("ada@cca.com", "password1")
+        hidden = self.client.get("/quote", follow_redirects=True)
+        self.assertIn("Only the admin", hidden.text)
+        self.assertNotIn("Save today's quote token", hidden.text)
         self.assertIn("Ben desk", opened.text)
+        blocked = self.client.get("/config", follow_redirects=True)
+        self.assertIn("Only the admin", blocked.text)
+        self.assertNotIn("Save lot amount", blocked.text)
+
+    def test_a_new_api_key_clears_the_saved_login(self):
+        from execution import store
+        from portal.passwords import hash_password
+
+        store.init()
+        owner = store.create_user("ada@cca.com", hash_password("password1"))
+        account_id = store.create_account(owner, "zerodha", "Ada desk", "AB1", "k", "s")
+        store.set_token(account_id, "old-token", "AB1")
+        self._login("ada@cca.com", "password1")
+        page = self.client.get(f"/accounts/{account_id}")
+        saved = self.client.post(f"/accounts/{account_id}", data={
+            "csrf": _csrf(page.text), "label": "Ada desk", "broker": "zerodha",
+            "client_id": "AB1", "product": "MIS", "mode": "paper", "enabled": "1",
+            "auto_kill": "1", "paper_balance": "100000", "api_key": "new-key",
+        }, follow_redirects=True)
+        self.assertIn("Daily login", saved.text)
+        fresh = store.get_account(account_id)
+        self.assertEqual(fresh["access_token_enc"], "")
+        self.assertEqual(fresh["token_date"], "")
 
     def test_admin_can_remove_an_account_unless_lots_are_open(self):
         from execution import store

@@ -28,6 +28,7 @@ from core import clock
 from core.crypto import encrypt
 from execution import store
 from execution.engine import CopyEngine, buy_block_reason
+from execution.risk import lots_for_balance
 from portal.passwords import hash_password, verify_password
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -134,9 +135,16 @@ def _present(account: dict) -> dict:
     row["has_token"] = bool(row.pop("access_token_enc", ""))
     row["broker_label"] = BROKERS.get(row["broker"], {}).get("label", row["broker"])
     row["live_ready"] = bool(BROKERS.get(row["broker"], {}).get("live"))
+    row["daily_auth"] = bool(BROKERS.get(row["broker"], {}).get("daily_auth"))
     row["block"] = block
     row["token_today"] = row.get("token_date") == clock.today().isoformat() and row["has_token"]
     row["day_pnl"] = store.day_realized(row["id"])
+    balance = row.get("paper_balance")
+    try:
+        balance_n = float(0 if balance is None else balance)
+    except (TypeError, ValueError):
+        balance_n = 0.0
+    row["paper_balance"] = int(balance_n) if balance_n.is_integer() else balance_n
     return row
 
 
@@ -239,6 +247,56 @@ def dashboard(request: Request):
         request, accounts=accounts, live_trading=config.LIVE_TRADING, brokers=BROKERS))
 
 
+@app.get("/quote", response_class=HTMLResponse)
+def quote_form(request: Request):
+    user = _user(request)
+    if user is None:
+        return _redirect("/login")
+    if user.get("role") != "admin":
+        return _redirect("/dashboard", "Only the admin renews the quote login")
+    from core.quote_login import login_url, saved
+    state = saved()
+    state.pop("access_token", None)
+    url = ""
+    error = ""
+    if state["has_key"]:
+        try:
+            url = login_url()
+        except Exception as exc:
+            error = str(exc)
+    return templates.TemplateResponse(request, "quote.html", _ctx(request, quote=state, login_url=url, error=error))
+
+
+@app.post("/quote", response_class=HTMLResponse)
+def quote_submit(request: Request, request_token: str = Form(""), csrf: str = Form("")):
+    user = _user(request)
+    if user is None:
+        return _redirect("/login")
+    if user.get("role") != "admin":
+        return _redirect("/dashboard", "Only the admin renews the quote login")
+    error = _check_csrf(request, csrf)
+    token = _request_token(request_token)
+    if not error and not token:
+        error = "Paste the redirect URL or the request token."
+    if error:
+        from core.quote_login import saved
+        state = saved()
+        state.pop("access_token", None)
+        return templates.TemplateResponse(
+            request, "quote.html", _ctx(request, quote=state, login_url="", error=error), status_code=400)
+    from core.quote_login import exchange
+    try:
+        session = exchange(token)
+    except Exception as exc:
+        from core.quote_login import saved
+        state = saved()
+        state.pop("access_token", None)
+        return templates.TemplateResponse(
+            request, "quote.html", _ctx(request, quote=state, login_url="", error=str(exc)), status_code=400)
+    who = session.get("user_name") or session.get("user_id") or "the quote login"
+    return _redirect("/quote", f"Quote token saved for {who}. The bot picks it up on its own.")
+
+
 @app.get("/accounts/new", response_class=HTMLResponse)
 def new_account_form(request: Request):
     if _user(request) is None:
@@ -248,19 +306,22 @@ def new_account_form(request: Request):
 
 @app.post("/accounts/new")
 def new_account(request: Request, label: str = Form(""), broker: str = Form(""),
-                client_id: str = Form(""), api_key: str = Form(""), api_secret: str = Form(""),
-                csrf: str = Form("")):
+                client_id: str = Form(""), mobile: str = Form(""), api_key: str = Form(""),
+                api_secret: str = Form(""), csrf: str = Form("")):
     user = _user(request)
     if user is None:
         return _redirect("/login")
-    error = _check_csrf(request, csrf) or _account_error(label, broker, api_key, api_secret, creating=True)
+    error = _check_csrf(request, csrf) or _account_error(
+        label, broker, api_key, api_secret, creating=True, client_id=client_id, mobile=mobile)
     if error:
         return templates.TemplateResponse(
             request, "account_new.html",
-            _ctx(request, brokers=BROKERS, error=error, label=label, broker=broker, client_id=client_id),
+            _ctx(request, brokers=BROKERS, error=error, label=label, broker=broker,
+                 client_id=client_id, mobile=mobile),
             status_code=400)
     account_id = store.create_account(
-        user["id"], broker, label, client_id, encrypt(api_key.strip()), encrypt(api_secret.strip()))
+        user["id"], broker, label, client_id, encrypt(api_key.strip()), encrypt(api_secret.strip()),
+        mobile=mobile.strip())
     return _redirect(f"/accounts/{account_id}", "Broker saved. It stays on paper until you arm it.")
 
 
@@ -272,17 +333,20 @@ def account_page(request: Request, account_id: int):
     account = store.get_account(account_id, _scope(user))
     if account is None:
         return _redirect("/dashboard", "That account was not found")
+    shown = _present(account)
     return templates.TemplateResponse(request, "account.html", _ctx(
-        request, account=_present(account), rules=store.rules_for(account_id),
-        brokers=BROKERS, live_trading=config.LIVE_TRADING))
+        request, account=shown, brokers=BROKERS, live_trading=config.LIVE_TRADING,
+        lot_preview=_lot_preview(shown["paper_balance"])))
 
 
 @app.post("/accounts/{account_id}")
 def save_account(request: Request, account_id: int, label: str = Form(""), broker: str = Form(""),
-                 client_id: str = Form(""), api_key: str = Form(""), api_secret: str = Form(""),
+                 client_id: str = Form(""), mobile: str = Form(""), api_key: str = Form(""),
+                 api_secret: str = Form(""),
                  product: str = Form("MIS"), mode: str = Form("paper"), enabled: str = Form(""),
                  auto_kill: str = Form(""), flatten_on_kill: str = Form(""),
                  max_loss_trade: str = Form(""), max_loss_day: str = Form(""),
+                 paper_balance: str = Form(""),
                  confirm_live: str = Form(""), csrf: str = Form("")):
     user = _user(request)
     if user is None:
@@ -302,65 +366,140 @@ def save_account(request: Request, account_id: int, label: str = Form(""), broke
         day_loss = _optional_loss(max_loss_day)
     except ValueError:
         error = error or "Loss limits must be blank or a positive number."
+        trade_loss = day_loss = None
+    try:
+        rehearsed = _paper_balance(paper_balance)
+    except ValueError:
+        error = error or "Paper balance must be a number that is zero or more."
+        rehearsed = 0.0
     if not label.strip():
         error = error or "Label is required."
+    if broker == "kotak" and not _mobile_ok(mobile):
+        error = error or "Kotak needs the mobile number with country code, like +919876543210."
+    if broker == "kotak" and not client_id.strip():
+        error = error or "Kotak needs the UCC in client id."
     if error:
         shown = _present(account)
         return templates.TemplateResponse(
             request, "account.html",
-            _ctx(request, account=shown, rules=store.rules_for(account_id), brokers=BROKERS,
-                 live_trading=config.LIVE_TRADING, error=error),
+            _ctx(request, account=shown, brokers=BROKERS,
+                 live_trading=config.LIVE_TRADING, error=error,
+                 lot_preview=_lot_preview(shown["paper_balance"])),
             status_code=400)
     fields = {
         "label": label.strip(), "broker": broker, "client_id": client_id.strip(),
+        "mobile": mobile.strip(),
         "product": product, "mode": "live" if mode == "live" else "paper",
         "enabled": 1 if enabled == "1" else 0,
         "auto_kill": 1 if auto_kill == "1" else 0,
         "flatten_on_kill": 1 if flatten_on_kill == "1" else 0,
         "max_loss_trade": trade_loss, "max_loss_day": day_loss,
+        "paper_balance": rehearsed,
     }
     if api_key.strip():
         fields["api_key_enc"] = encrypt(api_key.strip())
     if api_secret.strip():
         fields["api_secret_enc"] = encrypt(api_secret.strip())
+    relinked = broker != (account.get("broker") or "") or bool(api_key.strip())
+    if broker == "kotak" and client_id.strip() != (account.get("client_id") or ""):
+        relinked = True
+    if relinked and (account.get("access_token_enc") or ""):
+        fields["access_token_enc"] = ""
+        fields["token_date"] = ""
+    else:
+        relinked = False
     store.update_account(account_id, _scope(user), fields)
-    return _redirect(f"/accounts/{account_id}", "Saved")
+    note = "Saved. The old login was cleared, so open Daily login again." if relinked else "Saved"
+    return _redirect(f"/accounts/{account_id}", note)
 
 
-@app.post("/accounts/{account_id}/rules")
-def save_rule(request: Request, account_id: int, symbol: str = Form("*"), lots: str = Form("1"),
-              min_lots: str = Form("1"), max_lots: str = Form("1"), slippage_mode: str = Form("PERCENT"),
-              slippage_value: str = Form("0"), csrf: str = Form("")):
+@app.get("/config", response_class=HTMLResponse)
+def config_page(request: Request):
     user = _user(request)
-    if user is None or store.get_account(account_id, _scope(user)) is None:
-        return _redirect("/dashboard")
+    if user is None:
+        return _redirect("/login")
+    if user.get("role") != "admin":
+        return _redirect("/dashboard", "Only the admin sets lot size and slippage")
+    return templates.TemplateResponse(request, "config.html", _config_ctx(request))
+
+
+@app.post("/config/margin")
+def save_margin(request: Request, symbol: str = Form("*"), rupees_per_lot: str = Form(""),
+                csrf: str = Form("")):
+    user = _user(request)
+    if user is None:
+        return _redirect("/login")
+    if user.get("role") != "admin":
+        return _redirect("/dashboard", "Only the admin sets lot size and slippage")
     error = _check_csrf(request, csrf)
-    symbol = symbol.strip().upper() or "*"
+    key = symbol.strip().upper() or "*"
     try:
-        lots_n, min_n, max_n = int(lots), int(min_lots), int(max_lots)
-        slip = float(slippage_value)
+        rupees = float(str(rupees_per_lot).replace(",", "").strip())
     except ValueError:
-        lots_n = min_n = max_n = 0
-        slip = -1
-    if error or not _SYMBOL.fullmatch(symbol) or min_n < 1 or max_n < min_n or not min_n <= lots_n <= max_n:
-        error = error or "Lots must sit between min and max, and min must be at least 1."
-    if slippage_mode not in ("PERCENT", "POINTS") or slip < 0:
-        error = error or "Slippage must be PERCENT or POINTS, and not negative."
+        rupees = 0
+    if not error and (not _SYMBOL.fullmatch(key) or rupees <= 0):
+        error = "Name the symbol, or *, and set the rupees for one lot above zero."
     if error:
-        return _redirect(f"/accounts/{account_id}", error)
-    store.upsert_rule(account_id, symbol, lots_n, min_n, max_n, slippage_mode, slip)
-    return _redirect(f"/accounts/{account_id}", f"Rule saved for {symbol}")
+        return _redirect("/config", error)
+    store.upsert_margin(key, rupees)
+    label = "all other symbols" if key == "*" else key
+    return _redirect("/config", f"Saved ₹{rupees:,.0f} per lot for {label}")
 
 
-@app.post("/accounts/{account_id}/rules/delete")
-def remove_rule(request: Request, account_id: int, symbol: str = Form(""), csrf: str = Form("")):
+@app.post("/config/margin/delete")
+def remove_margin(request: Request, symbol: str = Form(""), csrf: str = Form("")):
     user = _user(request)
-    if user is None or store.get_account(account_id, _scope(user)) is None:
-        return _redirect("/dashboard")
+    if user is None:
+        return _redirect("/login")
+    if user.get("role") != "admin":
+        return _redirect("/dashboard", "Only the admin sets lot size and slippage")
     if _check_csrf(request, csrf):
-        return _redirect(f"/accounts/{account_id}", "Reload and try again")
-    store.delete_rule(account_id, symbol.strip().upper())
-    return _redirect(f"/accounts/{account_id}", "Rule removed")
+        return _redirect("/config", "Reload and try again")
+    key = symbol.strip().upper()
+    if key == "*":
+        return _redirect("/config", "The default row stays. Change its amount instead of removing it.")
+    store.delete_margin(key)
+    return _redirect("/config", f"Removed the lot amount for {key}")
+
+
+@app.post("/config/slippage")
+def save_slippage(request: Request, symbol: str = Form("*"), slippage_mode: str = Form("PERCENT"),
+                  slippage_value: str = Form("0"), csrf: str = Form("")):
+    user = _user(request)
+    if user is None:
+        return _redirect("/login")
+    if user.get("role") != "admin":
+        return _redirect("/dashboard", "Only the admin sets lot size and slippage")
+    error = _check_csrf(request, csrf)
+    key = symbol.strip().upper() or "*"
+    try:
+        slip = float(str(slippage_value).replace(",", "").strip())
+    except ValueError:
+        slip = -1
+    if not error and (not _SYMBOL.fullmatch(key) or slippage_mode not in ("PERCENT", "POINTS") or slip < 0):
+        error = "Slippage must be percent or points, and not negative."
+    if error:
+        return _redirect("/config", error)
+    store.upsert_slippage(key, slippage_mode, slip)
+    label = "all other symbols" if key == "*" else key
+    unit = "percent" if slippage_mode == "PERCENT" else "points"
+    return _redirect("/config", f"Saved {slip:g} {unit} slippage for {label}")
+
+
+@app.post("/config/slippage/delete")
+def remove_slippage(request: Request, symbol: str = Form(""), csrf: str = Form("")):
+    user = _user(request)
+    if user is None:
+        return _redirect("/login")
+    if user.get("role") != "admin":
+        return _redirect("/dashboard", "Only the admin sets lot size and slippage")
+    if _check_csrf(request, csrf):
+        return _redirect("/config", "Reload and try again")
+    key = symbol.strip().upper()
+    if key == "*":
+        return _redirect("/config", "The default row stays. Change its slippage instead of removing it.")
+    store.delete_slippage(key)
+    return _redirect("/config", f"Removed slippage for {key}")
 
 
 @app.post("/accounts/{account_id}/delete")
@@ -426,7 +565,8 @@ def auth_form(request: Request, account_id: int):
 
 
 @app.post("/accounts/{account_id}/auth", response_class=HTMLResponse)
-def auth_submit(request: Request, account_id: int, request_token: str = Form(""), csrf: str = Form("")):
+def auth_submit(request: Request, account_id: int, request_token: str = Form(""),
+                totp: str = Form(""), mobile: str = Form(""), csrf: str = Form("")):
     user = _user(request)
     if user is None:
         return _redirect("/login")
@@ -434,6 +574,8 @@ def auth_submit(request: Request, account_id: int, request_token: str = Form("")
     if account is None:
         return _redirect("/dashboard")
     error = _check_csrf(request, csrf)
+    if not error and account["broker"] == "kotak":
+        return _kotak_auth(request, account, totp, mobile or account.get("mobile") or "")
     token = _request_token(request_token)
     if not error and account["broker"] != "zerodha":
         error = f"{BROKERS.get(account['broker'], {}).get('label', account['broker'])} login is not available yet."
@@ -462,14 +604,69 @@ def orders(request: Request):
     return templates.TemplateResponse(request, "orders.html", _ctx(request, orders=store.recent_intents(_scope(user))))
 
 
-def _account_error(label: str, broker: str, api_key: str, api_secret: str, creating: bool) -> str:
+def _account_error(label: str, broker: str, api_key: str, api_secret: str, creating: bool,
+                   client_id: str = "", mobile: str = "") -> str:
     if broker not in BROKERS:
         return "Choose a broker."
     if not label.strip():
         return "Give the account a label."
     if creating and (not api_key.strip() or not api_secret.strip()):
         return "API key and secret are required."
+    if broker == "kotak" and creating and not client_id.strip():
+        return "Kotak needs the UCC in client id."
+    if broker == "kotak" and creating and not _mobile_ok(mobile):
+        return "Kotak needs the mobile number with country code, like +919876543210."
     return ""
+
+
+def _mobile_ok(mobile: str) -> bool:
+    text = (mobile or "").strip()
+    return text.startswith("+") and text[1:].isdigit() and 8 <= len(text) <= 16
+
+
+def _kotak_auth(request: Request, account: dict, totp: str, mobile: str):
+    if not _mobile_ok(mobile):
+        return templates.TemplateResponse(
+            request, "auth.html",
+            _ctx(request, account=_present(account), login_url="",
+                 error="Mobile number must include the country code, like +919876543210."),
+            status_code=400)
+    if (mobile or "").strip() != (account.get("mobile") or ""):
+        store.update_account(account["id"], None, {"mobile": mobile.strip()})
+        account = store.get_account(account["id"]) or account
+    try:
+        session = _kotak(account).login(mobile.strip(), account.get("client_id") or "", totp)
+    except Exception as exc:
+        return templates.TemplateResponse(
+            request, "auth.html",
+            _ctx(request, account=_present(account), login_url="", error=str(exc)), status_code=400)
+    store.set_token(account["id"], encrypt(session["access_token"]), session.get("user_id") or account.get("client_id") or "")
+    who = session.get("user_name") or session.get("user_id") or "your account"
+    return _redirect(f"/accounts/{account['id']}", f"Kotak Neo login saved for {who}")
+
+
+def _config_ctx(request: Request, error: str = "") -> dict:
+    return _ctx(request, margins=store.margin_rules(), slippage=store.slippage_rules(), error=error)
+
+
+def _lot_preview(balance: float) -> list:
+    rows = []
+    for rule in store.margin_rules():
+        rows.append({
+            "label": "All other symbols" if rule["symbol"] == "*" else rule["symbol"],
+            "lots": lots_for_balance(balance, rule["rupees_per_lot"]),
+        })
+    return rows
+
+
+def _paper_balance(raw: str) -> float:
+    text = (raw or "").strip().replace(",", "")
+    if not text:
+        raise ValueError(raw)
+    value = float(text)
+    if value < 0:
+        raise ValueError(raw)
+    return value
 
 
 def _optional_loss(raw: str) -> Optional[float]:
@@ -495,4 +692,16 @@ def _zerodha(account: dict):
         decrypt(account.get("api_key_enc") or ""),
         decrypt(account.get("api_secret_enc") or ""),
         decrypt(account.get("access_token_enc") or ""),
+    )
+
+
+def _kotak(account: dict):
+    from core.crypto import decrypt
+    from brokers.kotak import KotakBroker
+    return KotakBroker(
+        decrypt(account.get("api_key_enc") or ""),
+        decrypt(account.get("api_secret_enc") or ""),
+        decrypt(account.get("access_token_enc") or ""),
+        account.get("client_id") or "",
+        account.get("mobile") or "",
     )

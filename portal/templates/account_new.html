@@ -3,7 +3,7 @@
 {% block body %}
 <section class="card">
   <h1>Link a broker</h1>
-  <p class="lede">Keys are encrypted on this server. The account starts in paper mode. Dhan, Kotak and Groww can be saved now; only Zerodha can send orders today.</p>
+  <p class="lede">Keys are encrypted on this server. The account starts in paper mode. Zerodha uses the Kite API key and secret. Kotak Neo uses the Trade API token as the key, the MPIN as the secret, the UCC as the client id, and the registered mobile number. Dhan and Groww can be saved; they do not send orders yet.</p>
   <form method="post" action="/accounts/new">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <div class="grid">
@@ -20,15 +20,19 @@
         </select>
       </div>
       <div class="field">
-        <label for="client_id">Client id (optional)</label>
+        <label for="client_id">Client id / UCC</label>
         <input id="client_id" name="client_id" value="{{ client_id or '' }}">
       </div>
       <div class="field">
-        <label for="api_key">API key</label>
+        <label for="mobile">Mobile (Kotak, with country code)</label>
+        <input id="mobile" name="mobile" value="{{ mobile or '' }}" placeholder="+919876543210" autocomplete="tel">
+      </div>
+      <div class="field">
+        <label for="api_key">API key / Trade API token</label>
         <input id="api_key" name="api_key" autocomplete="off" required>
       </div>
       <div class="field">
-        <label for="api_secret">API secret</label>
+        <label for="api_secret">API secret / MPIN</label>
         <input id="api_secret" name="api_secret" type="password" autocomplete="new-password" required>
       </div>
     </div>

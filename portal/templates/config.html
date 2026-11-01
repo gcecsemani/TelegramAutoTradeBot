@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block title %}Config{% endblock %}
+{% block body %}
+<div class="page-head">
+  <div>
+    <p class="kicker">Admin</p>
+    <h1>Lot size and slippage</h1>
+    <p class="lede">These rules apply to every account. A named symbol replaces <code>*</code>. Lot size is the account's cash divided by the amount below, rounded down. Cash already in a position is not subtracted, so one trade does not shrink or block the next. It only chooses the lot size.</p>
+  </div>
+</div>
+
+<section class="card">
+  <h2>Rupees for one lot</h2>
+  <p class="lede">NIFTY, SENSEX and BANKNIFTY start at ₹50,000. CRUDE, GOLD, SILVER, natural gas and every other stock option use the <code>*</code> row, which starts at ₹100,000. Change either amount here.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Symbol</th><th class="num">Cash for 1 lot</th><th></th></tr></thead>
+      <tbody>
+        {% for rule in margins %}
+        <tr>
+          <td>{% if rule.symbol == '*' %}All other symbols{% else %}{{ rule.symbol }}{% endif %}</td>
+          <td class="num">₹{{ '{:,.0f}'.format(rule.rupees_per_lot) }}</td>
+          <td>
+            {% if rule.symbol != '*' %}
+            <form method="post" action="/config/margin/delete">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <input type="hidden" name="symbol" value="{{ rule.symbol }}">
+              <button class="ghost" type="submit">Remove</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <form class="rule-form" method="post" action="/config/margin">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <div class="grid">
+      <div class="field">
+        <label for="margin_symbol">Symbol</label>
+        <input id="margin_symbol" name="symbol" placeholder="NIFTY or *" required autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="rupees_per_lot">Rupees for 1 lot</label>
+        <input id="rupees_per_lot" name="rupees_per_lot" inputmode="decimal" placeholder="50000" required>
+      </div>
+    </div>
+    <p class="form-actions"><button type="submit">Save lot amount</button></p>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Slippage per symbol</h2>
+  <p class="lede">Buys are limit orders. The limit is the signal price plus this slippage, as a percent of price or as points. Exits are market orders. <code>*</code> covers every symbol without its own row.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Symbol</th><th>Slippage</th><th></th></tr></thead>
+      <tbody>
+        {% for rule in slippage %}
+        <tr>
+          <td>{% if rule.symbol == '*' %}All other symbols{% else %}{{ rule.symbol }}{% endif %}</td>
+          <td>{{ rule.slippage_value }} {{ rule.slippage_mode|lower }}</td>
+          <td>
+            {% if rule.symbol != '*' %}
+            <form method="post" action="/config/slippage/delete">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <input type="hidden" name="symbol" value="{{ rule.symbol }}">
+              <button class="ghost" type="submit">Remove</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <form class="rule-form" method="post" action="/config/slippage">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <div class="grid">
+      <div class="field">
+        <label for="slip_symbol">Symbol</label>
+        <input id="slip_symbol" name="symbol" placeholder="NIFTY or *" required autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="slippage_mode">Slippage</label>
+        <select id="slippage_mode" name="slippage_mode">
+          <option value="PERCENT">Percent</option>
+          <option value="POINTS">Points</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="slippage_value">Slippage value</label>
+        <input id="slippage_value" name="slippage_value" inputmode="decimal" placeholder="1" required>
+      </div>
+    </div>
+    <p class="form-actions"><button type="submit">Save slippage</button></p>
+  </form>
+</section>
+{% endblock %}
