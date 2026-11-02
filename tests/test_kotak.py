@@ -133,7 +133,7 @@ class OrderTests(unittest.TestCase):
         headers = http.calls[0][2]
         self.assertEqual(headers.get("neo-fin-key"), "neotradeapi")
         self.assertEqual(headers.get("Auth"), "trade")
-        self.assertNotIn("Authorization", headers)
+        self.assertEqual(headers.get("Authorization"), "consumer")
 
     def test_mcx_buys_are_day_orders_and_stops_stay_working(self):
         working = _Response(200, {"data": {"nOrdNo": "9002", "ordSt": "trigger pending", "GuiOrdId": "tag"}})

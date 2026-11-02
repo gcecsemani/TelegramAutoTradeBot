@@ -270,10 +270,12 @@ class KotakBroker:
     def _trade_headers(self, form: bool) -> dict:
         """Session headers for orders, limits and the order book.
 
-        The trade API wants Auth, Sid and neo-fin-key. The consumer key stays
-        on the login calls only.
+        Auth and Sid are the trading session. Authorization is the Trade API
+        access token again: Kotak's gateway answers 401 without it, which is
+        not a dead login.
         """
         headers = {
+            "Authorization": self.consumer_key,
             "Sid": self.sid,
             "Auth": self.token,
             "neo-fin-key": _FIN_KEY,

@@ -213,8 +213,8 @@ class CopyEngine:
         if not reason:
             try:
                 balance = self._cash_balance(account, event.exchange)
-            except TokenError:
-                reason = "login required"
+            except TokenError as exc:
+                reason = str(exc).strip() or "login required"
                 skip_status = "AUTH"
             except (BrokerError, TransientError, TypeError, ValueError) as exc:
                 reason = f"could not read the account balance ({exc})"
@@ -345,8 +345,9 @@ class CopyEngine:
             broker = self.broker_factory(account)
             view = broker.place(request)
         except TokenError as exc:
-            store.update_intent(intent["id"], status="AUTH", last_error=str(exc), reason="login required")
-            return Result(name, "AUTH", "login required")
+            detail = str(exc).strip() or "login required"
+            store.update_intent(intent["id"], status="AUTH", last_error=detail, reason=detail)
+            return Result(name, "AUTH", detail)
         except BrokerError as exc:
             store.update_intent(intent["id"], status="REJECTED", last_error=str(exc), reason=str(exc))
             return Result(name, "REJECTED", str(exc))
@@ -523,7 +524,8 @@ class CopyEngine:
         try:
             view = self.broker_factory(account).place(request)
         except TokenError as exc:
-            store.update_intent(claimed["id"], status="AUTH", last_error=str(exc), reason="login required")
+            detail = str(exc).strip() or "login required"
+            store.update_intent(claimed["id"], status="AUTH", last_error=detail, reason=detail)
             store.set_leg_stop(account["id"], intent["position_id"], "", trigger, 0, claimed["tag"], "FAILED")
             return
         except BrokerError as exc:
