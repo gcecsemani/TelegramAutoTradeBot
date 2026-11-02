@@ -131,7 +131,7 @@ class OrderTests(unittest.TestCase):
         self.assertEqual(sent["ig"], "c" + "a" * 19)
         self.assertEqual(sent["pf"], "N")
         headers = http.calls[0][2]
-        self.assertNotIn("neo-fin-key", headers)
+        self.assertEqual(headers.get("neo-fin-key"), "neotradeapi")
         self.assertEqual(headers.get("Auth"), "trade")
         self.assertEqual(headers.get("Sid"), "sid")
         self.assertNotIn("Authorization", headers)
@@ -146,8 +146,8 @@ class OrderTests(unittest.TestCase):
         headers = http.calls[0][2]
         self.assertEqual(headers.get("Auth"), "trade")
         self.assertEqual(headers.get("Sid"), "sid")
+        self.assertEqual(headers.get("neo-fin-key"), "neotradeapi")
         self.assertNotIn("Authorization", headers)
-        self.assertNotIn("neo-fin-key", headers)
         sent = json.loads(http.calls[0][4]["jData"])
         self.assertEqual(sent, {"seg": "ALL", "exch": "ALL", "prod": "ALL"})
 

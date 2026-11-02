@@ -31,7 +31,10 @@ import httpx
 
 from brokers.base import BrokerError, OrderRequest, OrderView, TokenError, TransientError
 from core.clock import IST
+from core.logging_setup import get
 from data.rate_limiter import TokenBucket
+
+log = get("kotak")
 
 _SESSION = "https://mis.kotaksecurities.com"
 _LOGIN = _SESSION + "/login/1.0/tradeApiLogin"
@@ -277,13 +280,13 @@ class KotakBroker:
     def _trade_headers(self, form: bool) -> dict:
         """Session headers for orders, limits and the order book.
 
-        e22 accepts Auth and Sid. Adding the Trade API access token on place
-        makes that same host answer 401, while the order book stays 200.
-        neo-fin-key stays on the login calls.
+        Place answers 401 without neo-fin-key. The access token stays off
+        these calls: e22 rejects it on place, while Auth and Sid are enough.
         """
         headers = {
             "Sid": self.sid,
             "Auth": self.token,
+            "neo-fin-key": _FIN_KEY,
         }
         if form:
             headers["Content-Type"] = "application/x-www-form-urlencoded"
@@ -625,7 +628,9 @@ def _decode(response, order_sent: bool):
         if status == 0:
             raise TransientError("empty Kotak response") from exc
     if status in (401, 403):
-        raise TokenError(_message(payload) or "Kotak session expired")
+        detail = _message(payload) or "Kotak session expired"
+        log.warning("Kotak HTTP %s: %s", status, detail)
+        raise TokenError(detail)
     if status == 429 or status >= 500:
         if order_sent:
             raise TransientError(_message(payload) or f"Kotak HTTP {status}")
