@@ -131,9 +131,25 @@ class OrderTests(unittest.TestCase):
         self.assertEqual(sent["ig"], "c" + "a" * 19)
         self.assertEqual(sent["pf"], "N")
         headers = http.calls[0][2]
-        self.assertEqual(headers.get("neo-fin-key"), "neotradeapi")
+        self.assertNotIn("neo-fin-key", headers)
         self.assertEqual(headers.get("Auth"), "trade")
+        self.assertEqual(headers.get("Sid"), "sid")
         self.assertEqual(headers.get("Authorization"), "consumer")
+
+    def test_balance_uses_the_session_without_the_access_token(self):
+        broker, http = self._broker([
+            ("/limits", _Response(200, {"data": [{
+                "Category": "FO", "Net": "150000", "MarginUsed": "0",
+            }]})),
+        ])
+        self.assertEqual(broker.cash_balance("NFO"), 150000)
+        headers = http.calls[0][2]
+        self.assertEqual(headers.get("Auth"), "trade")
+        self.assertEqual(headers.get("Sid"), "sid")
+        self.assertNotIn("Authorization", headers)
+        self.assertNotIn("neo-fin-key", headers)
+        sent = json.loads(http.calls[0][4]["jData"])
+        self.assertEqual(sent, {"seg": "ALL", "exch": "ALL", "prod": "ALL"})
 
     def test_mcx_buys_are_day_orders_and_stops_stay_working(self):
         working = _Response(200, {"data": {"nOrdNo": "9002", "ordSt": "trigger pending", "GuiOrdId": "tag"}})

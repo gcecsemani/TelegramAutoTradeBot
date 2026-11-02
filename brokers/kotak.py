@@ -176,7 +176,10 @@ class KotakBroker:
             "ig": order.tag[:20],
             "os": _SOURCE,
         }
-        payload = self._call("POST", self._url("quick/order/rule/ms/place"), self._trade_headers(form=True), form=body)
+        payload = self._call(
+            "POST", self._url("quick/order/rule/ms/place"),
+            self._trade_headers(form=True, access_token=True), form=body,
+        )
         order_id = str(payload.get("nOrdNo") or _data(payload).get("nOrdNo") or "")
         if not order_id or str(payload.get("stat") or "Ok").lower() not in ("ok", "success", ""):
             if not order_id:
@@ -199,7 +202,10 @@ class KotakBroker:
             "no": str(order_id),
             "os": _SOURCE,
         }
-        payload = self._call("POST", self._url("quick/order/vr/modify"), self._trade_headers(form=True), form=body)
+        payload = self._call(
+            "POST", self._url("quick/order/vr/modify"),
+            self._trade_headers(form=True, access_token=True), form=body,
+        )
         if _already_done(payload):
             return self.fetch(order_id)
         if str(payload.get("stat") or "Ok").lower() not in ("ok", "success", ""):
@@ -209,7 +215,8 @@ class KotakBroker:
     def cancel(self, order_id: str) -> OrderView:
         self._require_session()
         payload = self._call(
-            "POST", self._url("quick/order/cancel"), self._trade_headers(form=True),
+            "POST", self._url("quick/order/cancel"),
+            self._trade_headers(form=True, access_token=True),
             form={"on": str(order_id), "am": "NO"},
         )
         if _already_done(payload):
@@ -267,22 +274,24 @@ class KotakBroker:
         if not self.token or not self.sid or not self.base_url:
             raise TokenError("Kotak login is missing. Open Daily login and enter today's code")
 
-    def _trade_headers(self, form: bool) -> dict:
+    def _trade_headers(self, form: bool, access_token: bool = False) -> dict:
         """Session headers for orders, limits and the order book.
 
-        Auth and Sid are the trading session. Authorization is the Trade API
-        access token again: Kotak's gateway answers 401 without it, which is
-        not a dead login.
+        Limits and the order book take only Auth and Sid. Place, modify and
+        cancel also send the Trade API access token. neo-fin-key stays on the
+        login calls. Sending it on the balance call makes Kotak answer
+        unauthorized.
         """
         headers = {
-            "Authorization": self.consumer_key,
             "Sid": self.sid,
             "Auth": self.token,
-            "neo-fin-key": _FIN_KEY,
-            "accept": "application/json",
         }
+        if access_token:
+            headers["Authorization"] = self.consumer_key
         if form:
             headers["Content-Type"] = "application/x-www-form-urlencoded"
+        else:
+            headers["accept"] = "application/json"
         return headers
 
     def _url(self, path: str) -> str:
@@ -601,7 +610,13 @@ def _message(payload) -> str:
         return str(item)
     if error:
         return str(error)
-    return str(payload.get("errMsg") or payload.get("message") or payload.get("Error Message") or payload.get("rejRsn") or "")
+    fault = payload.get("fault")
+    if isinstance(fault, dict):
+        return str(fault.get("description") or fault.get("message") or fault)
+    return str(
+        payload.get("errMsg") or payload.get("emsg") or payload.get("message")
+        or payload.get("description") or payload.get("Error Message") or payload.get("rejRsn") or ""
+    )
 
 
 def _decode(response, order_sent: bool):
