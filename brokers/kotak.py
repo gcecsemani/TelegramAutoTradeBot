@@ -178,7 +178,7 @@ class KotakBroker:
         }
         payload = self._call(
             "POST", self._url("quick/order/rule/ms/place"),
-            self._trade_headers(form=True, access_token=True), form=body,
+            self._trade_headers(form=True), form=body,
         )
         order_id = str(payload.get("nOrdNo") or _data(payload).get("nOrdNo") or "")
         if not order_id or str(payload.get("stat") or "Ok").lower() not in ("ok", "success", ""):
@@ -204,7 +204,7 @@ class KotakBroker:
         }
         payload = self._call(
             "POST", self._url("quick/order/vr/modify"),
-            self._trade_headers(form=True, access_token=True), form=body,
+            self._trade_headers(form=True), form=body,
         )
         if _already_done(payload):
             return self.fetch(order_id)
@@ -216,7 +216,7 @@ class KotakBroker:
         self._require_session()
         payload = self._call(
             "POST", self._url("quick/order/cancel"),
-            self._trade_headers(form=True, access_token=True),
+            self._trade_headers(form=True),
             form={"on": str(order_id), "am": "NO"},
         )
         if _already_done(payload):
@@ -274,20 +274,17 @@ class KotakBroker:
         if not self.token or not self.sid or not self.base_url:
             raise TokenError("Kotak login is missing. Open Daily login and enter today's code")
 
-    def _trade_headers(self, form: bool, access_token: bool = False) -> dict:
+    def _trade_headers(self, form: bool) -> dict:
         """Session headers for orders, limits and the order book.
 
-        Limits and the order book take only Auth and Sid. Place, modify and
-        cancel also send the Trade API access token. neo-fin-key stays on the
-        login calls. Sending it on the balance call makes Kotak answer
-        unauthorized.
+        e22 accepts Auth and Sid. Adding the Trade API access token on place
+        makes that same host answer 401, while the order book stays 200.
+        neo-fin-key stays on the login calls.
         """
         headers = {
             "Sid": self.sid,
             "Auth": self.token,
         }
-        if access_token:
-            headers["Authorization"] = self.consumer_key
         if form:
             headers["Content-Type"] = "application/x-www-form-urlencoded"
         else:
