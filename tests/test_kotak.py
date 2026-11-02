@@ -134,7 +134,7 @@ class OrderTests(unittest.TestCase):
         self.assertEqual(headers.get("neo-fin-key"), "neotradeapi")
         self.assertEqual(headers.get("Auth"), "trade")
         self.assertEqual(headers.get("Sid"), "sid")
-        self.assertNotIn("Authorization", headers)
+        self.assertEqual(headers.get("Authorization"), "consumer")
 
     def test_balance_uses_the_session_without_the_access_token(self):
         broker, http = self._broker([

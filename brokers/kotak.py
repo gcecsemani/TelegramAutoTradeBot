@@ -181,7 +181,7 @@ class KotakBroker:
         }
         payload = self._call(
             "POST", self._url("quick/order/rule/ms/place"),
-            self._trade_headers(form=True), form=body,
+            self._trade_headers(form=True, access_token=True), form=body,
         )
         order_id = str(payload.get("nOrdNo") or _data(payload).get("nOrdNo") or "")
         if not order_id or str(payload.get("stat") or "Ok").lower() not in ("ok", "success", ""):
@@ -207,7 +207,7 @@ class KotakBroker:
         }
         payload = self._call(
             "POST", self._url("quick/order/vr/modify"),
-            self._trade_headers(form=True), form=body,
+            self._trade_headers(form=True, access_token=True), form=body,
         )
         if _already_done(payload):
             return self.fetch(order_id)
@@ -219,7 +219,7 @@ class KotakBroker:
         self._require_session()
         payload = self._call(
             "POST", self._url("quick/order/cancel"),
-            self._trade_headers(form=True),
+            self._trade_headers(form=True, access_token=True),
             form={"on": str(order_id), "am": "NO"},
         )
         if _already_done(payload):
@@ -277,17 +277,20 @@ class KotakBroker:
         if not self.token or not self.sid or not self.base_url:
             raise TokenError("Kotak login is missing. Open Daily login and enter today's code")
 
-    def _trade_headers(self, form: bool) -> dict:
+    def _trade_headers(self, form: bool, access_token: bool = False) -> dict:
         """Session headers for orders, limits and the order book.
 
-        Place answers 401 without neo-fin-key. The access token stays off
-        these calls: e22 rejects it on place, while Auth and Sid are enough.
+        Place on e22 needs the access token and neo-fin-key together with
+        Auth and Sid. Either one alone comes back 401. Limits and the order
+        book stay on the session only.
         """
         headers = {
             "Sid": self.sid,
             "Auth": self.token,
             "neo-fin-key": _FIN_KEY,
         }
+        if access_token:
+            headers["Authorization"] = self.consumer_key
         if form:
             headers["Content-Type"] = "application/x-www-form-urlencoded"
         else:
@@ -629,7 +632,12 @@ def _decode(response, order_sent: bool):
             raise TransientError("empty Kotak response") from exc
     if status in (401, 403):
         detail = _message(payload) or "Kotak session expired"
-        log.warning("Kotak HTTP %s: %s", status, detail)
+        raw = ""
+        try:
+            raw = (response.text or "")[:400]
+        except Exception:
+            raw = ""
+        log.warning("Kotak HTTP %s: %s", status, raw or detail)
         raise TokenError(detail)
     if status == 429 or status >= 500:
         if order_sent:
