@@ -45,6 +45,11 @@ _EXIT_RETRY_SEC = 3
 _STOP_RETRY_SEC = 15
 
 
+def _market_stop_blocked(text: str) -> bool:
+    """Kotak's MCX option block on a stop-market. One later try sends a stop-limit."""
+    return "stop loss market order not allowed" in (text or "").lower()
+
+
 @dataclass
 class Result:
     label: str
@@ -866,13 +871,17 @@ class CopyEngine:
             rejected = store.count_action_status(leg["account_id"], leg["position_id"], "SL", "REJECTED")
             if rejected >= 3:
                 latest = store.latest_action(leg["account_id"], leg["position_id"], "SL")
-                if latest and latest.get("last_error") != "STOP GAVE UP":
-                    store.update_intent(latest["id"], last_error="STOP GAVE UP")
-                    self.notify(
-                        f"⚠️ Stop rejected 3 times · {_esc(leg.get('tradingsymbol') or '')}\n"
-                        "This account is open with no broker stop. Exit it from the signal if you want it closed."
-                    )
-                continue
+                text = f"{(latest or {}).get('last_error') or ''} {(latest or {}).get('reason') or ''}"
+                if _market_stop_blocked(text):
+                    store.update_intent(latest["id"], last_error="STOP RETRY LIMIT")
+                else:
+                    if latest and latest.get("last_error") != "STOP GAVE UP":
+                        store.update_intent(latest["id"], last_error="STOP GAVE UP")
+                        self.notify(
+                            f"⚠️ Stop rejected 3 times · {_esc(leg.get('tradingsymbol') or '')}\n"
+                            "This account is open with no broker stop. Exit it from the signal if you want it closed."
+                        )
+                    continue
             if _age(leg.get("updated_at") or "") < _STOP_RETRY_SEC:
                 continue
             account = store.get_account(leg["account_id"])

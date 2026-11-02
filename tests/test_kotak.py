@@ -13,6 +13,7 @@ import pytz                                           # noqa: E402
 from brokers.base import BrokerError, OrderRequest    # noqa: E402
 from brokers.kotak import (  # noqa: E402
     KotakBroker, parse_kite_symbol, resolve_trading_symbol, scrip_board_lot, scrip_file_url,
+    sell_stop_limit,
 )
 
 
@@ -204,10 +205,39 @@ class OrderTests(unittest.TestCase):
         self.assertEqual(view.status, "OPEN")
         sent = json.loads(http.calls[0][4]["jData"])
         self.assertEqual(sent["es"], "mcx_fo")
-        self.assertEqual(sent["pt"], "SL-M")
+        self.assertEqual(sent["pt"], "SL")
         self.assertEqual(sent["rt"], "DAY")
         self.assertEqual(sent["tp"], "80.00")
+        self.assertEqual(sent["pr"], "76.00")
+        self.assertEqual(sell_stop_limit(400), 380.0)
+
+    def test_an_mcx_stop_move_stays_a_limit_stop(self):
+        book = _Response(200, {"data": [{
+            "nOrdNo": "9002", "ordSt": "trigger pending", "exSeg": "mcx_fo", "prcTp": "SL",
+        }]})
+        broker, http = self._broker([
+            ("/user/orders", book),
+            ("/modify", _Response(200, {"stat": "Ok", "nOrdNo": "9002"})),
+        ])
+        broker.modify("9002", 400, 20)
+        sent = json.loads(http.calls[1][4]["jData"])
+        self.assertEqual(sent["pt"], "SL")
+        self.assertEqual(sent["tp"], "400.00")
+        self.assertEqual(sent["pr"], "380.00")
+        self.assertEqual(sent["qt"], "20")
+
+    def test_an_nfo_stop_stays_a_stop_market(self):
+        working = _Response(200, {"data": {"nOrdNo": "9003", "ordSt": "trigger pending"}})
+        broker, http = self._broker([
+            ("/place", _Response(200, {"stat": "Ok", "nOrdNo": "9003"})),
+            ("/user/orders", working),
+        ], symbols=lambda exchange, symbol: "NIFTY-STOP")
+        broker.place(_order(order_type="SL-M", price=0, trigger_price=80, tag="tag"))
+        sent = json.loads(http.calls[0][4]["jData"])
+        self.assertEqual(sent["es"], "nse_fo")
+        self.assertEqual(sent["pt"], "SL-M")
         self.assertEqual(sent["pr"], "0")
+        self.assertEqual(sent["tp"], "80.00")
 
     def test_recovery_finds_the_order_by_its_tag(self):
         book = _Response(200, {"data": [

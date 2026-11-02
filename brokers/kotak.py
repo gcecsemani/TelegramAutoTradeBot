@@ -169,6 +169,11 @@ class KotakBroker:
         validity = "DAY" if segment == "mcx_fo" else order.validity
         price = "0" if order_type in ("MKT", "SL-M") else _px(order.price)
         trigger = _px(order.trigger_price) if order_type == "SL-M" else "0"
+        if segment == "mcx_fo" and order.order_type == "SL-M":
+            # MCX options reject a stop-market. A sell stop-limit sits under the trigger.
+            order_type = "SL"
+            price = _px(sell_stop_limit(order.trigger_price))
+            trigger = _px(order.trigger_price)
         body = {
             "am": "NO",
             "dq": "0",
@@ -200,12 +205,17 @@ class KotakBroker:
 
     def modify(self, order_id: str, trigger_price: float, quantity: int) -> OrderView:
         self._require_session()
+        price_type = "SL-M"
+        price = "0"
+        if _mcx_order(self._book_row(order_id, order_sent=False)):
+            price_type = "SL"
+            price = _px(sell_stop_limit(trigger_price))
         body = {
             "mp": "0",
             "dq": "0",
             "vd": "DAY",
-            "pr": "0",
-            "pt": "SL-M",
+            "pr": price,
+            "pt": price_type,
             "am": "NO",
             "tp": _px(trigger_price),
             "qt": str(int(quantity)),
@@ -236,11 +246,18 @@ class KotakBroker:
         except TransientError:
             return OrderView(str(order_id), "CANCELLED", 0.0, 0, "cancel sent")
 
+    def _book_row(self, order_id: str, order_sent: bool = True):
+        book = self._call(
+            "GET", self._url("quick/user/orders"), self._trade_headers(form=False),
+            order_sent=order_sent,
+        )
+        wanted = str(order_id)
+        return next((item for item in _rows(book) if str(item.get("nOrdNo") or "") == wanted), None)
+
     def fetch(self, order_id: str) -> OrderView:
         self._require_session()
         wanted = str(order_id)
-        book = self._call("GET", self._url("quick/user/orders"), self._trade_headers(form=False))
-        row = next((item for item in _rows(book) if str(item.get("nOrdNo") or "") == wanted), None)
+        row = self._book_row(wanted)
         if row is None:
             payload = self._call(
                 "POST", self._url("quick/order/history"), self._trade_headers(form=True),
@@ -552,6 +569,27 @@ def _segment(exchange: str) -> str:
     if not segment:
         raise BrokerError(f"Kotak does not take exchange {exchange}")
     return segment
+
+
+def sell_stop_limit(trigger: float, buffer: float = 0.05) -> float:
+    """Limit under a sell trigger. Kotak MCX options refuse a stop-market."""
+    trigger = round(float(trigger or 0), 2)
+    if trigger <= 0:
+        return 0.0
+    tick = 0.05
+    price = round(round((trigger * (1 - buffer)) / tick) * tick, 2)
+    if price >= trigger:
+        price = round(trigger - tick, 2)
+    if price <= 0:
+        price = tick
+    return price
+
+
+def _mcx_order(row) -> bool:
+    if not isinstance(row, dict):
+        return False
+    segment = str(row.get("exSeg") or row.get("es") or row.get("exc") or "").lower()
+    return "mcx" in segment
 
 
 def _order_type(kind: str) -> str:
