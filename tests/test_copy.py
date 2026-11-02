@@ -269,6 +269,70 @@ class FanoutTests(unittest.TestCase):
         again = store.buy_intent(self.one, "pos-live-again")
         self.assertEqual(again["lots"], 4)
 
+    def test_live_kotak_mcx_orders_the_board_lot_and_books_the_same_lots(self):
+        class Live:
+            def __init__(self):
+                self.quantities = []
+
+            def cash_balance(self, exchange):
+                return 200000
+
+            def board_lot(self, exchange, symbol):
+                return 10
+
+            def place(self, order):
+                self.quantities.append(order.quantity)
+                if order.order_type == "SL-M":
+                    return OrderView(f"sl-{order.tag}", "OPEN", 0, 0, "stop")
+                return OrderView("OID", "COMPLETE", order.price or 480, order.quantity, "accepted")
+
+            def find_by_tag(self, tag):
+                return None
+
+            def fetch(self, order_id):
+                return None
+
+            def cancel(self, order_id):
+                return OrderView(order_id, "CANCELLED", 0, 0, "cancelled")
+
+            def modify(self, order_id, trigger_price, quantity):
+                return OrderView(order_id, "OPEN", 0, 0, "modified")
+
+        config.LIVE_TRADING = True
+        store.update_account(self.one, self.user, {"mode": "live", "broker": "kotak"})
+        store.set_token(self.one, "token", "AB1234")
+        store.update_account(self.two, self.user, {
+            "kill_switch": 0, "kill_reason": "", "paper_balance": 200000,
+        })
+        live = Live()
+        paper = copy_engine.build_broker(store.get_account(self.two))
+        self.engine.broker_factory = lambda account: live if account["id"] == self.one else paper
+        crude = dict(
+            position_id="crude-mini", symbol="CRUDEOILM", exchange="MCX",
+            tradingsymbol="CRUDEOILM26NOV9300PE", lot_size=1, multiplier=10,
+            price=480.55, sl=333.05, exact=True,
+        )
+        self.engine.handle(_event(**crude))
+        bought = store.buy_intent(self.one, "crude-mini")
+        paper_buy = store.buy_intent(self.two, "crude-mini")
+        self.assertEqual(bought["status"], "FILLED")
+        self.assertEqual(bought["lots"], 2)
+        self.assertEqual(bought["quantity"], 20)
+        self.assertEqual(live.quantities[0], 20)
+        self.assertEqual(store.get_leg(self.one, "crude-mini")["lots_open"], 2)
+        self.assertEqual(paper_buy["quantity"], 2)
+        self.assertEqual(store.get_leg(self.two, "crude-mini")["lots_open"], 2)
+
+        self.engine.handle(_event(
+            action="SELL", lots=2, lots_before=2, price=490.55, reason="BOOK",
+            position_id="crude-mini", symbol="CRUDEOILM", exchange="MCX",
+            tradingsymbol="CRUDEOILM26NOV9300PE", lot_size=1, multiplier=10,
+        ))
+        self.assertEqual(live.quantities[-1], 20)
+        self.assertEqual(store.get_leg(self.one, "crude-mini")["lots_open"], 0)
+        self.assertEqual(store.day_realized(self.one), store.day_realized(self.two))
+        self.assertEqual(store.day_realized(self.one), 200.0)
+
     def test_an_exact_price_buy_does_not_add_slippage(self):
         self.engine.handle(_event(position_id="pos-exact", price=100, exact=True))
         self.assertEqual(store.buy_intent(self.one, "pos-exact")["limit_price"], 100)

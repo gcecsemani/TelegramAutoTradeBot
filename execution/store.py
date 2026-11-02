@@ -599,7 +599,12 @@ def apply_fill(account_id: int, position_id: str, *, side: str, lots: int, quant
         elif leg and int(leg["lots_open"]) > 0:
             sell_lots = min(lots, int(leg["lots_open"]))
             sell_qty = min(quantity, int(leg["quantity_open"])) or sell_lots * max(1, int(leg["multiplier"]))
-            pnl = round((price - float(leg["avg_entry"])) * sell_qty, 2)
+            # Points times lots times the contract multiplier. Order quantity is
+            # the broker size (Kotak MCX is the board lot; Kite MCX is the lot count).
+            pnl = round(
+                (price - float(leg["avg_entry"])) * sell_lots * max(1, int(leg["multiplier"] or 1)),
+                2,
+            )
             left_lots = int(leg["lots_open"]) - sell_lots
             left_qty = max(0, int(leg["quantity_open"]) - sell_qty)
             conn.execute(

@@ -141,6 +141,13 @@ class KotakBroker:
             "user_name": session.get("greetingName") or self.ucc,
         }
 
+    def board_lot(self, exchange: str, tradingsymbol: str) -> int:
+        """Units Kotak accepts for one MCX lot. A lot count such as 2 is rejected."""
+        if _segment(exchange) != "mcx_fo":
+            return 1
+        rows = _scrip_rows(self._http, self.consumer_key, "mcx_fo", self.base_url)
+        return scrip_board_lot(rows, tradingsymbol)
+
     def cash_balance(self, exchange: str) -> float:
         """Cash used only to choose a lot size.
 
@@ -438,16 +445,24 @@ def parse_kite_symbol(tradingsymbol: str):
 
 def resolve_trading_symbol(rows: list, tradingsymbol: str) -> str:
     """Kotak pTrdSymbol for a Zerodha contract, or '' when the scrip file has no row."""
+    row = resolve_contract(rows, tradingsymbol)
+    if not row:
+        return ""
+    return str(_col(row, "pTrdSymbol") or "")
+
+
+def resolve_contract(rows: list, tradingsymbol: str):
+    """Scrip row for a Zerodha contract, or None when the file has no match."""
     wanted = (tradingsymbol or "").upper().strip()
     if not wanted:
-        return ""
+        return None
     parsed = parse_kite_symbol(wanted)
     for row in rows:
         symbol = str(_col(row, "pTrdSymbol") or "").upper()
         if symbol == wanted:
-            return str(_col(row, "pTrdSymbol"))
+            return row
     if parsed is None:
-        return ""
+        return None
     name, when, strike, opt, monthly = parsed
     for row in rows:
         if str(_col(row, "pSymbolName") or "").upper().strip() != name:
@@ -460,10 +475,32 @@ def resolve_trading_symbol(rows: list, tradingsymbol: str) -> str:
         dates = _row_dates(row)
         if monthly:
             if any(item.year == when.year and item.month == when.month for item in dates):
-                return str(_col(row, "pTrdSymbol"))
+                return row
         elif when in dates:
-            return str(_col(row, "pTrdSymbol"))
-    return ""
+            return row
+    return None
+
+
+def scrip_board_lot(rows: list, tradingsymbol: str) -> int:
+    """Kotak order size for one lot. MCX quotes this as barrels or units, not the lot count."""
+    row = resolve_contract(rows, tradingsymbol)
+    if not row:
+        return 1
+    return _lot_size(row)
+
+
+def _lot_size(row: dict) -> int:
+    for name in ("lLotSize", "iLotSize"):
+        raw = _col(row, name)
+        if raw in (None, ""):
+            continue
+        try:
+            size = int(float(str(raw).strip()))
+        except (TypeError, ValueError):
+            continue
+        if size > 0:
+            return size
+    return 1
 
 
 def scrip_file_url(payload, segment: str) -> str:

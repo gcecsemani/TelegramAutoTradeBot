@@ -11,7 +11,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytz                                           # noqa: E402
 
 from brokers.base import BrokerError, OrderRequest    # noqa: E402
-from brokers.kotak import KotakBroker, parse_kite_symbol, resolve_trading_symbol, scrip_file_url  # noqa: E402
+from brokers.kotak import (  # noqa: E402
+    KotakBroker, parse_kite_symbol, resolve_trading_symbol, scrip_board_lot, scrip_file_url,
+)
 
 
 def _epoch(year, month, day) -> str:
@@ -88,6 +90,24 @@ class SymbolTests(unittest.TestCase):
         self.assertEqual(resolve_trading_symbol(rows, "CRUDEOIL26NOV5200CE"), "CRUDEOIL26NOV5200CE")
         self.assertEqual(resolve_trading_symbol(rows, "SENSEX26N0572800PE"), "")
 
+    def test_mcx_board_lot_is_the_scrip_lot_not_the_lot_count(self):
+        epoch = _epoch(2026, 11, 19)
+        rows = [
+            {
+                "pSymbolName": "CRUDEOILM", "pTrdSymbol": "CRUDEOILM19NOV269300PE",
+                "pOptionType": "PE", "pExpiryDate": epoch, "dStrikePrice;": "930000",
+                "lLotSize": "10",
+            },
+            {
+                "pSymbolName": "GOLD", "pTrdSymbol": "GOLD19NOV26120000CE",
+                "pOptionType": "CE", "pExpiryDate": epoch, "dStrikePrice;": "1200000",
+                "iLotSize": "1",
+            },
+        ]
+        self.assertEqual(scrip_board_lot(rows, "CRUDEOILM26NOV9300PE"), 10)
+        self.assertEqual(scrip_board_lot(rows, "GOLD26NOV12000CE"), 1)
+        self.assertEqual(scrip_board_lot(rows, "NIFTY26N0322800PE"), 1)
+
     def test_scrip_file_url_reads_either_response_shape(self):
         top = {"filesPaths": [
             "https://files.example/nse_cm.csv",
@@ -150,6 +170,26 @@ class OrderTests(unittest.TestCase):
         self.assertNotIn("Authorization", headers)
         sent = json.loads(http.calls[0][4]["jData"])
         self.assertEqual(sent, {"seg": "ALL", "exch": "ALL", "prod": "ALL"})
+
+    def test_board_lot_reads_the_mcx_scrip_file(self):
+        epoch = _epoch(2026, 11, 19)
+        csv_body = (
+            "pSymbolName,pTrdSymbol,pOptionType,pExpiryDate,dStrikePrice;,lLotSize\n"
+            f"CRUDEOILM,CRUDEOILM19NOV269300PE,PE,{epoch},930000,10\n"
+        )
+
+        class _CSV(_Response):
+            def __init__(self):
+                super().__init__(200, {})
+                self.text = csv_body
+                self.content = csv_body.encode()
+
+        broker, _http = self._broker([
+            ("file-paths", _Response(200, {"data": {"filesPaths": ["https://files.example/mcx_fo.csv"]}})),
+            ("mcx_fo.csv", _CSV()),
+        ])
+        self.assertEqual(broker.board_lot("NFO", "NIFTY26N0322800PE"), 1)
+        self.assertEqual(broker.board_lot("MCX", "CRUDEOILM26NOV9300PE"), 10)
 
     def test_mcx_buys_are_day_orders_and_stops_stay_working(self):
         working = _Response(200, {"data": {"nOrdNo": "9002", "ordSt": "trigger pending", "GuiOrdId": "tag"}})

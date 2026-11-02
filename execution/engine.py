@@ -243,10 +243,19 @@ class CopyEngine:
                     )
                     if not plan.ok:
                         reason = plan.reason
+        lots = plan.lots if plan and plan.ok else 0
+        quantity = plan.quantity if plan and plan.ok else 0
+        limit = plan.limit_price if plan and plan.ok else 0.0
+        if plan and plan.ok and not reason:
+            try:
+                quantity = self._kotak_mcx_quantity(account, event, plan)
+            except TokenError as exc:
+                reason = str(exc).strip() or "login required"
+                skip_status = "AUTH"
+            except (BrokerError, TransientError, TypeError, ValueError) as exc:
+                reason = f"could not read the Kotak lot size ({exc})"
         key = f"{event.position_id}:{account['id']}:BUY"
-        row = _intent_row(key, account, event, "BUY", plan.lots if plan and plan.ok else 0,
-                          plan.quantity if plan and plan.ok else 0,
-                          plan.limit_price if plan and plan.ok else 0.0,
+        row = _intent_row(key, account, event, "BUY", lots, quantity, limit,
                           "LIMIT", reason or "ENTRY")
         if not store.claim_intent(row):
             return Result(name, "DONE", "already handled", notify=False)
@@ -255,6 +264,27 @@ class CopyEngine:
             store.update_intent(intent["id"], status=skip_status, reason=reason)
             return Result(name, skip_status, reason)
         return self._send(account, intent, "BUY")
+
+    def _kotak_mcx_quantity(self, account: dict, event: CopyEvent, plan) -> int:
+        """Kotak MCX quantity is lots times the scrip board lot.
+
+        Kite lists those contracts with lot size 1, so the shared sizer sends
+        the lot count. Kotak rejects that as not lotwise: crude mini is 10
+        barrels, crude is 100. NFO is already in exchange units. Paper and
+        Zerodha keep the lot count.
+        """
+        if account.get("mode") != "live" or account.get("broker") != "kotak":
+            return plan.quantity
+        if (event.exchange or "").upper() != "MCX" or int(event.lot_size or 0) > 1:
+            return plan.quantity
+        broker = self.broker_factory(account)
+        reader = getattr(broker, "board_lot", None)
+        if reader is None:
+            return plan.quantity
+        board = int(reader(event.exchange, event.tradingsymbol) or 1)
+        if board > 1:
+            return plan.lots * board
+        return plan.quantity
 
     def _cash_balance(self, account: dict, exchange: str) -> float:
         """Paper uses the saved balance. Live reads broker cash and does not
