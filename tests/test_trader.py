@@ -594,6 +594,14 @@ class CommandTests(Harness):
             self.post(command)
         self.assertEqual(self.tg.sent, [])
 
+    def test_commands_work_when_the_signal_group_is_the_update_group(self):
+        self.tg.signal_chats = {SIGNAL}
+        self.tg.update_chat = SIGNAL
+        self.post("/op")
+        self.assertIn("Nothing is open or waiting", self.tg.last())
+        self.post("/pnl")
+        self.assertIn("P&amp;L", self.tg.last())
+
 
 class TwoGroupTests(Harness):
     CALL = "NIFTY 22800PE\nBuy CMP\nSl 80"

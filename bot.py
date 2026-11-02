@@ -296,7 +296,8 @@ class SignalBot:
 
         command = parse_command(text)
         if command:
-            if not in_signal and fresh:            # /op /pnl /trades answer in the update group only
+            # Answer in the update group. One shared group is both, so this still runs there.
+            if chat == self.tg.update_chat and fresh:
                 self._command(command, msg_ref)
             return
 

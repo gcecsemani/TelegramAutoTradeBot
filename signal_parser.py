@@ -43,7 +43,7 @@ FOLLOW-UP (a reply that tags the call, or the bot's message about it)
 
 EXIT ALL (its own message): "Exit all" closes every trade and drops every waiting call.
 
-COMMANDS (update group only): /op open positions · /pnl today's P&L · /trades the trades file
+COMMANDS (update group, including when it is also the signal group): /op open positions · /pnl today's P&L · /trades the trades file
 """
 
 from __future__ import annotations

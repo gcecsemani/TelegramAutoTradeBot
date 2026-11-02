@@ -68,7 +68,9 @@ An SL must be below the live premium, otherwise it is refused and the old SL sta
 
 `Exit all` as its own message closes every open trade and drops every waiting call.
 
-## Commands (update group only)
+## Commands
+
+Send these in the update group. When that group is also the signal group, they work in that same chat.
 
 | Send | Gets |
 |---|---|
