@@ -38,7 +38,7 @@ Buy Above 120
 Buy Near 110
 ```
 
-`Buy Above` and `Buy Near` need a price. `Sl` and `Tgt` can go on the same reply. After it is taken, tag that same message to manage it (Exit, SL, targets, Buy again). A second buy on it is refused while that trade is still open or waiting.
+`Buy Above` and `Buy Near` need a price. `Sl` and `Tgt` can go on the same reply. After it is taken, tag that same message to manage it (Exit, SL, targets, Buy again). A second buy on it is refused while that trade is still open. While it is still waiting, tag it with `Buy Near`, `Buy Above` or `Buy CMP` to replace the entry.
 
 | Entry | Buys when |
 |---|---|
@@ -47,7 +47,7 @@ Buy Near 110
 | `Buy only 100` · `Buy.100` · `Buy. 100` | only when the ask is exactly 100 |
 | `Buy CMP` | straight away, at the current price |
 
-- **Lots:** the signal book takes 2 lots (`TRADE["lots"]` in `config.py`), so "book half" is half of that book. Each linked account takes the lot count for the balance range its cash falls in, set on the portal Config page.
+- **Lots:** the signal book takes 1 lot (`TRADE["lots"]` in `config.py`). Book half closes that lot. Each linked account takes the lot count for the balance range its cash falls in, set on the portal Config page.
 - **Waiting calls:** a call still waiting is dropped at that day's square-off.
 - **No SL in the call:** the bot sets one 30% below the fill until you send yours.
 - **SL already broken:** if the price is already at or below your SL when it would buy, the call is refused (or dropped, if it was waiting).
@@ -61,10 +61,11 @@ Works the same for SENSEX, CRUDEOIL, NATURALGAS, GOLD(M), SILVER(M), BANKNIFTY a
 | `SL 70` | SL to 70 |
 | `SL to cost` · `SL at cost` · `SL at CTC` · `SL CTC` | SL to your entry price |
 | `No sl` · `Hero zero` · `Hero to Zero` | no SL |
-| `Exit` · `Book` · `Book full` · `Book fully` · `Ignore` · `Avoid` · `Cancel` · `Close` · `Sell` · `SL hit` | sells **both lots** now, in profit or loss. A call still waiting is dropped |
-| `Book half` · `Book 50` · `Book 50%` | sells **1 of the 2 lots** now. On the last lot it sells that one |
+| `Exit` · `Book` · `Book full` · `Book fully` · `Ignore` · `Avoid` · `Cancel` · `Close` · `Sell` · `SL hit` | sells the lot now, in profit or loss. A call still waiting is dropped |
+| `Book half` · `Book 50` · `Book 50%` | sells half the lots. With 1 lot open, that sells the lot |
 | `Tgt 110` · `Tgt 110 120 130` · `Target 110` · `Target 110 120 130` | replaces the targets |
-| `Buy again` · `Buy again Above 100` · `Buy again Near 100` · `Buy again CMP` | posts the same call again — same strike, same SL and targets, 2 new lots. Plain `Buy again` keeps the original entry; the other three use that entry instead. Only once the previous trade on it is closed (or dropped); after that, tags on the original call act on the new trade |
+| `Buy Near 100` · `Buy Above 100` · `Buy CMP` | while the call is **still waiting**, replaces that entry. `Buy CMP` buys now. `Buy Near` / `Buy Above` buy when that rule is met, and keep waiting otherwise. An open trade is left unchanged |
+| `Buy again` · `Buy again Above 100` · `Buy again Near 100` · `Buy again CMP` | posts the same call again — same strike, same SL and targets, 1 new lot. Plain `Buy again` keeps the original entry; the other three use that entry instead. Only once the previous trade on it is closed (or dropped); after that, tags on the original call act on the new trade |
 
 An SL must be below the live premium, otherwise it is refused and the old SL stays.
 

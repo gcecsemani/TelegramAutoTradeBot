@@ -11,7 +11,9 @@ signal_parser.py are acted on; everything else is ignored.
 A reply is matched to its trade by the message it replies to: your call in
 the signal group, or any bot message about that trade in the update group.
 A reply of Buy Above / Near / CMP on a message that only names the option
-(a watchlist line) opens that trade.
+(a watchlist line) opens that trade. The same reply on a call that is still
+waiting replaces that entry: Buy CMP buys now, and Buy Near / Buy Above buy
+when the new rule is met. An open trade is left unchanged.
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ from data.kite_gateway import KiteGateway, TokenExpired
 from execution.engine import CopyEngine
 from notify.telegram import TelegramClient, TelegramError, esc, ref
 from paper_trader import JOURNAL_COLUMNS, OPEN, PENDING, PaperTrader, money, one_lot_rows
-from signal_parser import BuyCall, parse, parse_command
+from signal_parser import BuyCall, parse, parse_command, parse_entry_reply
 
 log = get("bot")
 
@@ -132,8 +134,10 @@ class SignalBot:
         ]
         if access:
             lines += ["", f"⚠️ <b>I cannot read normal messages yet.</b>\n{esc(access)}"]
+        book_lots = int(config.TRADE["lots"])
+        lot_word = "lot" if book_lots == 1 else "lots"
         lines += ["", f"Reading calls from group {esc(', '.join(sorted(self.tg.signal_chats)))}: "
-                      f"Buy Above / Near / CMP, {config.TRADE['lots']} lots. "
+                      f"Buy Above / Near / CMP, {book_lots} {lot_word}. "
                       "Tag a watchlist line (SENSEX 72800 PE) with Buy Above 120 / Buy Near 110 / Buy CMP to take it. "
                       "Tag a call (or my trade "
                       "message here) with Exit, Book half, SL …, Tgt …, Buy again, Buy again Above / Near / CMP; "
@@ -349,6 +353,8 @@ class SignalBot:
                 self.notify("ℹ️ No trade is linked to the message you tagged. Tag the buy call itself "
                             f"or my ✅ BOUGHT message.\n{_said(text)}", msg_ref)
             return
+        if self._retarget_if_waiting(text, parsed, reply_ref, msg_ref, age, fresh):
+            return
         if not in_signal:
             return                      # the update group takes follow-ups and Exit all only
         if parsed.kind == "BUY":
@@ -356,9 +362,8 @@ class SignalBot:
             stored = text
             if parsed.from_tag:
                 pos = self.trader.find_by_message(reply_ref)
-                if pos is not None and pos.status in (OPEN, PENDING) and fresh:
-                    what = "still open" if pos.status == OPEN else "still waiting to buy"
-                    self.notify(f"ℹ️ {esc(pos.label)} is {what} on the message you tagged. "
+                if pos is not None and pos.status == OPEN and fresh:
+                    self.notify(f"ℹ️ {esc(pos.label)} is still open on the message you tagged. "
                                 f"Exit it first, or send the full call as its own message.\n{_said(text)}", msg_ref)
                     return
                 stored = parsed.call.as_text()
@@ -366,6 +371,31 @@ class SignalBot:
             self._handle_call(parsed.call, msg_ref, stored, age, extra)
         elif parsed.kind == "INVALID" and fresh:
             self.notify(f"❓ <b>Not taken</b> — {esc(parsed.error)}\n{_said(text)}", msg_ref)
+
+    def _retarget_if_waiting(self, text: str, parsed, reply_ref: Optional[str], msg_ref: str,
+                             age: float, fresh: bool) -> bool:
+        """Buy Near / Above / CMP tagged onto a call that is still waiting
+        replaces that entry. Returns True when the reply was handled."""
+        if not reply_ref:
+            return False
+        pos = self.trader.find_by_message(reply_ref)
+        if pos is None or pos.status != PENDING:
+            return False
+        if parsed.kind == "BUY" and parsed.from_tag:
+            entry = parsed.call
+        elif parsed.kind == "BUY":
+            return False
+        else:
+            entry, _error = parse_entry_reply(text)
+        if entry is None:
+            return False
+        if not fresh:
+            if age < IGNORE_AFTER_SEC:
+                self.notify(f"⌛ <b>Entry not changed</b> — your message is {age / 60:.0f} min old "
+                            f"(I was offline). Send it again if it is still valid.\n{_said(text)}", msg_ref)
+            return True
+        self.trader.retarget_waiting(pos, entry, msg_ref)
+        return True
 
     def _handle_call(self, call: BuyCall, msg_ref: str, text: str, age: float, extra_refs=()) -> None:
         if age > config.TRADE["max_signal_age_sec"]:

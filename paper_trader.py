@@ -1,7 +1,7 @@
 """
 paper_trader.py
 ===============
-Paper positions opened from Telegram calls: 2 lots, nearest expiry.
+Paper positions opened from Telegram calls: 1 lot, nearest expiry.
 
     entry   Buy CMP      buys now at the live ask.
             Buy Near X   buys once the ask is at most X + 2.5%. Lower is fine.
@@ -9,6 +9,8 @@ Paper positions opened from Telegram calls: 2 lots, nearest expiry.
                          at most X + 2.5%. If it has run further, it waits for
                          the premium to come back into that band.
             A call still waiting is dropped at the session square-off.
+            Tag a waiting call with Buy Near / Buy Above / Buy CMP to replace
+            that entry. Buy CMP buys now; the others buy when their rule is met.
     stop    exits every open lot at the bid when the LTP trades at or below
             the SL. No SL in the call → 30% under the fill until you send one.
             "No sl" / "Hero zero" → no stop.
@@ -460,7 +462,7 @@ class PaperTrader:
             return False
         return pos.mode == "NEAR" or quote.ltp >= float(pos.level)
 
-    def _fill(self, pos: Position, quote: Quote) -> str:
+    def _fill(self, pos: Position, quote: Quote, reply_to: Optional[str] = None) -> str:
         """Buy every lot at the ask. Returns a refusal when the SL is already
         at or above the price."""
         price = _round_tick(quote.buy_price(), pos.tick_size)
@@ -491,7 +493,7 @@ class PaperTrader:
             reason="ENTRY", signal_ref=pos.signal_ref,
             exact=pos.mode == "ONLY",
         ))
-        self._notify_opened(pos)
+        self._notify_opened(pos, reply_to)
         return ""
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -710,6 +712,69 @@ class PaperTrader:
             if call.targets and call.targets != pos.targets:
                 self._set_targets(pos, call.targets, ref)
         self.save()
+
+    def retarget_waiting(self, pos: Position, call: BuyCall, ref: str) -> None:
+        """A tagged Buy Near / Above / CMP on a call that is still waiting
+        replaces the entry. Buy CMP, and a Near / Above that is already met,
+        buy now. Anything else keeps waiting on the new rule."""
+        if call.symbol and (call.symbol, call.opt_type, float(call.strike)) != (
+                pos.symbol, pos.opt_type, float(pos.strike)):
+            self.notify(
+                f"⚠️ That entry is for {esc(call.contract_text())}. {esc(pos.label)} is unchanged — "
+                "tag it with Exit and post a new call.",
+                ref, pos.id,
+            )
+            return
+        with self.lock:
+            if pos.status != PENDING:
+                if pos.status == OPEN:
+                    self.notify(f"ℹ️ {esc(pos.label)} is still open on the message you tagged. "
+                                "Exit it first, or send the full call as its own message.", ref, pos.id)
+                else:
+                    self._already_done(pos, ref)
+                return
+            self._apply_entry(pos, call)
+            if ref not in pos.refs:
+                pos.refs.append(ref)
+        quote = self._quote(pos.key)
+        with self.lock:
+            if pos.status != PENDING:
+                return
+            if quote is not None:
+                pos.last_ltp = quote.ltp
+            if quote is not None and self._entry_ready(pos, quote):
+                error = self._fill(pos, quote, ref)
+                if error:
+                    self._cancel(pos, error, ref)
+            elif quote is not None:
+                self._notify_waiting(pos, quote, ref)
+            else:
+                self.notify(
+                    f"✏️ Entry for the waiting {esc(pos.label)} is now {esc(pos.entry_text())}. "
+                    "No live quote, so it stays waiting.",
+                    ref, pos.id,
+                )
+        self.save()
+
+    def _apply_entry(self, pos: Position, call: BuyCall) -> None:
+        pos.mode = call.mode
+        pos.level = None if call.mode == "CMP" else call.level
+        pos.level_high = float(call.level_high or 0)
+        if call.book_level:
+            pos.book_level = float(call.book_level)
+            pos.book_pct = float(call.book_pct or 100)
+        if call.no_sl:
+            pos.sl, pos.no_sl = None, True
+        elif call.sl is not None:
+            pos.sl, pos.no_sl = call.sl, False
+        if call.targets:
+            pos.targets = list(call.targets)
+        pos.signal_text = BuyCall(
+            symbol=pos.symbol, strike=pos.strike, opt_type=pos.opt_type,
+            mode=pos.mode, level=pos.level, level_high=pos.level_high or None,
+            book_level=pos.book_level or None, book_pct=pos.book_pct or 100,
+            sl=pos.sl, no_sl=pos.no_sl, targets=list(pos.targets),
+        ).as_text()
 
     def exit_all(self, ref: str) -> None:
         active = self.active()
@@ -940,7 +1005,7 @@ class PaperTrader:
     #  Messages
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _notify_opened(self, pos: Position) -> None:
+    def _notify_opened(self, pos: Position, reply_to: Optional[str] = None) -> None:
         targets = " / ".join(f"{t:g}" for t in pos.targets) or "—"
         lines = [
             f"✅ <b>BOUGHT {esc(pos.label)}</b> · PAPER",
@@ -953,13 +1018,13 @@ class PaperTrader:
             lines.append(self._book_line(pos))
         if pos.sl_note:
             lines.append(f"<i>{esc(pos.sl_note)}</i>")
-        self.notify("\n".join(lines), pos.signal_ref, pos.id)
+        self.notify("\n".join(lines), reply_to or pos.signal_ref, pos.id)
 
     def _book_line(self, pos: Position) -> str:
         share = "everything" if pos.book_pct >= 100 else f"{pos.book_pct:g}%"
         return f"Books {share} at {pos.book_level:g} or above"
 
-    def _notify_waiting(self, pos: Position, quote: Quote) -> None:
+    def _notify_waiting(self, pos: Position, quote: Quote, reply_to: Optional[str] = None) -> None:
         if pos.mode == "ONLY":
             when = f"the ask is exactly {pos.level:g}"
         elif pos.mode == "RANGE":
@@ -977,7 +1042,7 @@ class PaperTrader:
         ]
         if pos.book_level > 0:
             lines.append(self._book_line(pos))
-        self.notify("\n".join(lines), pos.signal_ref, pos.id)
+        self.notify("\n".join(lines), reply_to or pos.signal_ref, pos.id)
 
     def pnl_text(self) -> str:
         today = clock.today().isoformat()
