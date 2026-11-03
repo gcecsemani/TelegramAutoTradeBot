@@ -145,6 +145,13 @@ def _present(account: dict) -> dict:
     except (TypeError, ValueError):
         balance_n = 0.0
     row["paper_balance"] = int(balance_n) if balance_n.is_integer() else balance_n
+    pct = row.get("max_loss_day_pct")
+    try:
+        pct_n = float(pct) if pct is not None else None
+    except (TypeError, ValueError):
+        pct_n = None
+    if pct_n is not None:
+        row["max_loss_day_pct"] = int(pct_n) if pct_n.is_integer() else pct_n
     return row
 
 
@@ -345,8 +352,8 @@ def save_account(request: Request, account_id: int, label: str = Form(""), broke
                  api_secret: str = Form(""),
                  product: str = Form("MIS"), mode: str = Form("paper"), enabled: str = Form(""),
                  auto_kill: str = Form(""), flatten_on_kill: str = Form(""),
-                 max_loss_trade: str = Form(""), max_loss_day: str = Form(""),
-                 paper_balance: str = Form(""),
+                 max_loss_trade: str = Form(""), max_loss_day_pct: str = Form(""),
+                 paper_balance: str = Form(""), telegram_chat: str = Form(""),
                  confirm_live: str = Form(""), csrf: str = Form("")):
     user = _user(request)
     if user is None:
@@ -363,10 +370,14 @@ def save_account(request: Request, account_id: int, label: str = Form(""), broke
         error = error or "Unknown broker."
     try:
         trade_loss = _optional_loss(max_loss_trade)
-        day_loss = _optional_loss(max_loss_day)
     except ValueError:
-        error = error or "Loss limits must be blank or a positive number."
-        trade_loss = day_loss = None
+        error = error or "Max loss per trade must be blank or a positive number."
+        trade_loss = None
+    try:
+        day_pct = _optional_pct(max_loss_day_pct)
+    except ValueError:
+        error = error or "Max loss per day must be a percent of cash up to 100, or blank."
+        day_pct = None
     try:
         rehearsed = _paper_balance(paper_balance)
     except ValueError:
@@ -378,6 +389,11 @@ def save_account(request: Request, account_id: int, label: str = Form(""), broke
         error = error or "Kotak needs the mobile number with country code, like +919876543210."
     if broker == "kotak" and not client_id.strip():
         error = error or "Kotak needs the UCC in client id."
+    try:
+        owner_chat = _telegram_chat(telegram_chat)
+    except ValueError:
+        error = error or "Telegram chat id must be the number from your chat with the bot, or blank."
+        owner_chat = ""
     if error:
         shown = _present(account)
         return templates.TemplateResponse(
@@ -393,7 +409,7 @@ def save_account(request: Request, account_id: int, label: str = Form(""), broke
         "enabled": 1 if enabled == "1" else 0,
         "auto_kill": 1 if auto_kill == "1" else 0,
         "flatten_on_kill": 1 if flatten_on_kill == "1" else 0,
-        "max_loss_trade": trade_loss, "max_loss_day": day_loss,
+        "max_loss_trade": trade_loss, "max_loss_day_pct": day_pct,
         "paper_balance": rehearsed,
     }
     if api_key.strip():
@@ -409,6 +425,7 @@ def save_account(request: Request, account_id: int, label: str = Form(""), broke
     else:
         relinked = False
     store.update_account(account_id, _scope(user), fields)
+    store.set_telegram_chat(account["user_id"], owner_chat)
     note = "Saved. The old login was cleared, so open Daily login again." if relinked else "Saved"
     return _redirect(f"/accounts/{account_id}", note)
 
@@ -423,9 +440,9 @@ def config_page(request: Request):
     return templates.TemplateResponse(request, "config.html", _config_ctx(request))
 
 
-@app.post("/config/margin")
-def save_margin(request: Request, symbol: str = Form("*"), rupees_per_lot: str = Form(""),
-                csrf: str = Form("")):
+@app.post("/config/lot-band")
+def save_lot_band(request: Request, symbol: str = Form("*"), min_balance: str = Form(""),
+                  max_balance: str = Form(""), lots: str = Form(""), csrf: str = Form("")):
     user = _user(request)
     if user is None:
         return _redirect("/login")
@@ -434,20 +451,30 @@ def save_margin(request: Request, symbol: str = Form("*"), rupees_per_lot: str =
     error = _check_csrf(request, csrf)
     key = symbol.strip().upper() or "*"
     try:
-        rupees = float(str(rupees_per_lot).replace(",", "").strip())
+        low = _band_money(min_balance)
+        high = _band_money(max_balance)
+        count = _band_lots(lots)
     except ValueError:
-        rupees = 0
-    if not error and (not _SYMBOL.fullmatch(key) or rupees <= 0):
-        error = "Name the symbol, or *, and set the rupees for one lot above zero."
+        low, high, count = -1.0, -1.0, 0
+    if not error and (not _SYMBOL.fullmatch(key) or low < 0 or high < low or count < 1):
+        error = "Name the symbol, or *, and set a balance range with at least 1 lot."
     if error:
         return _redirect("/config", error)
-    store.upsert_margin(key, rupees)
+    try:
+        store.add_lot_band(key, low, high, count)
+    except store.RangeOverlap as hit:
+        label = "all other symbols" if hit.symbol == "*" else hit.symbol
+        return _redirect(
+            "/config",
+            f"That range overlaps {label} ₹{hit.min_balance:,.0f}–₹{hit.max_balance:,.0f}.",
+        )
     label = "all other symbols" if key == "*" else key
-    return _redirect("/config", f"Saved ₹{rupees:,.0f} per lot for {label}")
+    noun = "lot" if count == 1 else "lots"
+    return _redirect("/config", f"Saved {label} ₹{low:,.0f}–₹{high:,.0f} as {count} {noun}")
 
 
-@app.post("/config/margin/delete")
-def remove_margin(request: Request, symbol: str = Form(""), csrf: str = Form("")):
+@app.post("/config/lot-band/delete")
+def remove_lot_band(request: Request, band_id: str = Form(""), csrf: str = Form("")):
     user = _user(request)
     if user is None:
         return _redirect("/login")
@@ -455,11 +482,11 @@ def remove_margin(request: Request, symbol: str = Form(""), csrf: str = Form("")
         return _redirect("/dashboard", "Only the admin sets lot size and slippage")
     if _check_csrf(request, csrf):
         return _redirect("/config", "Reload and try again")
-    key = symbol.strip().upper()
-    if key == "*":
-        return _redirect("/config", "The default row stays. Change its amount instead of removing it.")
-    store.delete_margin(key)
-    return _redirect("/config", f"Removed the lot amount for {key}")
+    try:
+        store.delete_lot_band(int(str(band_id).strip()))
+    except (TypeError, ValueError):
+        return _redirect("/config", "That range was not found")
+    return _redirect("/config", "Removed that lot range")
 
 
 @app.post("/config/slippage")
@@ -646,17 +673,50 @@ def _kotak_auth(request: Request, account: dict, totp: str, mobile: str):
 
 
 def _config_ctx(request: Request, error: str = "") -> dict:
-    return _ctx(request, margins=store.margin_rules(), slippage=store.slippage_rules(), error=error)
+    return _ctx(request, bands=store.lot_bands(), slippage=store.slippage_rules(), error=error)
 
 
 def _lot_preview(balance: float) -> list:
     rows = []
-    for rule in store.margin_rules():
+    seen = set()
+    for band in store.lot_bands():
+        if band["symbol"] in seen:
+            continue
+        seen.add(band["symbol"])
         rows.append({
-            "label": "All other symbols" if rule["symbol"] == "*" else rule["symbol"],
-            "lots": lots_for_balance(balance, rule["rupees_per_lot"]),
+            "label": "All other symbols" if band["symbol"] == "*" else band["symbol"],
+            "lots": lots_for_balance(balance, store.lot_bands_for(band["symbol"])),
         })
     return rows
+
+
+def _telegram_chat(raw: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if not text.lstrip("-").isdigit() or not 5 <= len(text.lstrip("-")) <= 20:
+        raise ValueError(raw)
+    return text
+
+
+def _band_money(raw: str) -> float:
+    text = str(raw or "").replace(",", "").strip()
+    if not text:
+        raise ValueError(raw)
+    value = float(text)
+    if value < 0:
+        raise ValueError(raw)
+    return value
+
+
+def _band_lots(raw: str) -> int:
+    text = str(raw or "").replace(",", "").strip()
+    if not text:
+        raise ValueError(raw)
+    value = float(text)
+    if value < 1 or value != int(value):
+        raise ValueError(raw)
+    return int(value)
 
 
 def _paper_balance(raw: str) -> float:
@@ -666,6 +726,18 @@ def _paper_balance(raw: str) -> float:
     value = float(text)
     if value < 0:
         raise ValueError(raw)
+    return value
+
+
+def _optional_pct(raw: str) -> Optional[float]:
+    raw = (raw or "").strip().rstrip("%")
+    if not raw:
+        return None
+    value = float(raw)
+    if value < 0 or value > 100:
+        raise ValueError(raw)
+    if value == 0:
+        return None
     return value
 
 

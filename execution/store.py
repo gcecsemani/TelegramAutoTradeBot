@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS users (
     email TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'user',
+    telegram_chat_id TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS accounts (
@@ -46,6 +47,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     flatten_on_kill INTEGER NOT NULL DEFAULT 0,
     max_loss_trade REAL,
     max_loss_day REAL,
+    max_loss_day_pct REAL,
     paper_balance REAL NOT NULL DEFAULT 100000,
     created_at TEXT NOT NULL
 );
@@ -120,6 +122,14 @@ CREATE TABLE IF NOT EXISTS margin_rules (
     symbol TEXT PRIMARY KEY,
     rupees_per_lot REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS lot_bands (
+    id INTEGER PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    min_balance REAL NOT NULL,
+    max_balance REAL NOT NULL,
+    lots INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lot_bands_symbol ON lot_bands(symbol, min_balance);
 CREATE TABLE IF NOT EXISTS slippage_rules (
     symbol TEXT PRIMARY KEY,
     slippage_mode TEXT NOT NULL,
@@ -142,11 +152,15 @@ def init() -> None:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
         if "role" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+        if "telegram_chat_id" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN telegram_chat_id TEXT NOT NULL DEFAULT ''")
         account_cols = {row[1] for row in conn.execute("PRAGMA table_info(accounts)")}
         if "mobile" not in account_cols:
             conn.execute("ALTER TABLE accounts ADD COLUMN mobile TEXT NOT NULL DEFAULT ''")
         if "paper_balance" not in account_cols:
             conn.execute("ALTER TABLE accounts ADD COLUMN paper_balance REAL NOT NULL DEFAULT 100000")
+        if "max_loss_day_pct" not in account_cols:
+            conn.execute("ALTER TABLE accounts ADD COLUMN max_loss_day_pct REAL")
         _seed_copy_rules(conn)
         intent_cols = {row[1] for row in conn.execute("PRAGMA table_info(intents)")}
         if "stop_trigger" not in intent_cols:
@@ -190,15 +204,47 @@ def _symbol_key(symbol: str) -> str:
     return text or "*"
 
 
+# The old one-amount-per-lot rows. An untouched copy of these becomes the
+# balance ranges below. A customised amount is turned into ranges that keep
+# the same lot count, so a portal edit is not thrown away.
+_OLD_MARGIN = (
+    ("NIFTY", 50000.0),
+    ("SENSEX", 50000.0),
+    ("BANKNIFTY", 50000.0),
+    ("*", 100000.0),
+)
+# NIFTY, SENSEX and BANKNIFTY: ₹35,000–₹50,000 is 1 lot, then the next
+# ranges step up. `*` is every other symbol. Both ends of a range count.
+_INDEX_BANDS = (
+    (35000, 50000, 1),
+    (50001, 100000, 2),
+    (100001, 150000, 3),
+    (150001, 250000, 4),
+    (250001, 500000, 5),
+)
+_OTHER_BANDS = (
+    (100000, 199999, 1),
+    (200000, 299999, 2),
+    (300000, 499999, 3),
+    (500000, 1000000, 4),
+)
+
+
+def _default_lot_bands() -> list:
+    rows = []
+    for symbol in ("NIFTY", "SENSEX", "BANKNIFTY"):
+        for low, high, lots in _INDEX_BANDS:
+            rows.append((symbol, low, high, lots))
+    for low, high, lots in _OTHER_BANDS:
+        rows.append(("*", low, high, lots))
+    return rows
+
+
 def _seed_copy_rules(conn: sqlite3.Connection) -> None:
     """First-run amounts. Later edits in the portal are left alone."""
     conn.execute("BEGIN IMMEDIATE")
     try:
-        if int(conn.execute("SELECT COUNT(*) FROM margin_rules").fetchone()[0]) == 0:
-            conn.executemany(
-                "INSERT INTO margin_rules (symbol, rupees_per_lot) VALUES (?, ?)",
-                (("NIFTY", 50000), ("SENSEX", 50000), ("BANKNIFTY", 50000), ("*", 100000)),
-            )
+        _seed_lot_bands(conn)
         if int(conn.execute("SELECT COUNT(*) FROM slippage_rules").fetchone()[0]) == 0:
             conn.execute(
                 """INSERT INTO slippage_rules (symbol, slippage_mode, slippage_value)
@@ -246,6 +292,11 @@ def ensure_admin(email: str, password_hash: str, rename_from: str = "") -> None:
     create_user(email, password_hash, role="admin")
 
 
+def set_telegram_chat(user_id: int, chat_id: str) -> None:
+    with connect() as conn:
+        conn.execute("UPDATE users SET telegram_chat_id = ? WHERE id = ?", (chat_id, int(user_id)))
+
+
 def user_by_email(email: str) -> Optional[dict]:
     with connect() as conn:
         return _one(conn, "SELECT * FROM users WHERE email = ?", (email.strip().lower(),))
@@ -274,7 +325,7 @@ def update_account(account_id: int, user_id: Optional[int], fields: dict) -> Non
     allowed = {
         "label", "client_id", "mobile", "api_key_enc", "api_secret_enc", "mode", "enabled",
         "product", "kill_switch", "kill_reason", "auto_kill", "flatten_on_kill",
-        "max_loss_trade", "max_loss_day", "paper_balance", "broker",
+        "max_loss_trade", "max_loss_day", "max_loss_day_pct", "paper_balance", "broker",
         "access_token_enc", "token_date",
     }
     sets, args = [], []
@@ -309,16 +360,23 @@ def set_kill(account_id: int, on: bool, reason: str) -> None:
         )
 
 
+_ACCOUNT_FROM = """SELECT accounts.*, users.email AS owner_email,
+                          users.telegram_chat_id AS owner_telegram
+                   FROM accounts JOIN users ON users.id = accounts.user_id"""
+
+
 def get_account(account_id: int, user_id: Optional[int] = None) -> Optional[dict]:
+    sql = _ACCOUNT_FROM + " WHERE accounts.id = ?"
+    args: tuple = (account_id,)
+    if user_id is not None:
+        sql += " AND accounts.user_id = ?"
+        args = (account_id, user_id)
     with connect() as conn:
-        if user_id is None:
-            return _one(conn, "SELECT * FROM accounts WHERE id = ?", (account_id,))
-        return _one(conn, "SELECT * FROM accounts WHERE id = ? AND user_id = ?", (account_id, user_id))
+        return _one(conn, sql, args)
 
 
 def list_accounts(user_id: Optional[int] = None) -> List[dict]:
-    sql = """SELECT accounts.*, users.email AS owner_email
-             FROM accounts JOIN users ON users.id = accounts.user_id"""
+    sql = _ACCOUNT_FROM
     args: tuple = ()
     if user_id is not None:
         sql += " WHERE accounts.user_id = ?"
@@ -331,7 +389,7 @@ def list_accounts(user_id: Optional[int] = None) -> List[dict]:
 def copy_accounts() -> List[dict]:
     """Enabled accounts the signal book should copy into."""
     with connect() as conn:
-        return _all(conn, "SELECT * FROM accounts WHERE enabled = 1 ORDER BY id")
+        return _all(conn, _ACCOUNT_FROM + " WHERE accounts.enabled = 1 ORDER BY accounts.id")
 
 
 def delete_account(account_id: int, user_id: Optional[int] = None) -> str:
@@ -368,40 +426,99 @@ def delete_account(account_id: int, user_id: Optional[int] = None) -> str:
     return ""
 
 
-def margin_rules() -> List[dict]:
-    with connect() as conn:
-        return _all(conn, "SELECT * FROM margin_rules ORDER BY symbol != '*', symbol")
+class RangeOverlap(Exception):
+    """The new range crosses one that is already saved for this symbol."""
+
+    def __init__(self, symbol: str, min_balance: float, max_balance: float):
+        self.symbol = symbol
+        self.min_balance = float(min_balance)
+        self.max_balance = float(max_balance)
+        super().__init__(symbol)
 
 
-def upsert_margin(symbol: str, rupees_per_lot: float) -> None:
+def ranges_overlap(left_min: float, left_max: float, right_min: float, right_max: float) -> bool:
+    """True when the two ranges share more than an endpoint."""
+    if left_max < right_min or right_max < left_min:
+        return False
+    if left_max == right_min or right_max == left_min:
+        return False
+    return True
+
+
+def _seed_lot_bands(conn: sqlite3.Connection) -> None:
+    if int(conn.execute("SELECT COUNT(*) FROM lot_bands").fetchone()[0]):
+        return
+    saved = conn.execute("SELECT symbol, rupees_per_lot FROM margin_rules").fetchall()
+    current = {(row[0], float(row[1])) for row in saved}
+    if not current or current == set(_OLD_MARGIN):
+        conn.executemany(
+            "INSERT INTO lot_bands (symbol, min_balance, max_balance, lots) VALUES (?, ?, ?, ?)",
+            _default_lot_bands(),
+        )
+        return
+    for row in saved:
+        per = float(row[1])
+        if per <= 0:
+            continue
+        for step in range(1, 11):
+            conn.execute(
+                "INSERT INTO lot_bands (symbol, min_balance, max_balance, lots) VALUES (?, ?, ?, ?)",
+                (row[0], per * step, per * (step + 1) - 1, step),
+            )
+
+
+def lot_bands() -> List[dict]:
     with connect() as conn:
-        conn.execute(
-            """INSERT INTO margin_rules (symbol, rupees_per_lot) VALUES (?, ?)
-               ON CONFLICT(symbol) DO UPDATE SET rupees_per_lot = excluded.rupees_per_lot""",
-            (_symbol_key(symbol), float(rupees_per_lot)),
+        return _all(conn, "SELECT * FROM lot_bands ORDER BY symbol = '*', symbol, min_balance")
+
+
+def lot_bands_for(symbol: str) -> List[dict]:
+    """Ranges for this symbol. A named symbol does not also use `*`."""
+    key = _symbol_key(symbol)
+    with connect() as conn:
+        if key != "*":
+            rows = _all(
+                conn,
+                "SELECT * FROM lot_bands WHERE symbol = ? ORDER BY min_balance, max_balance",
+                (key,),
+            )
+            if rows:
+                return rows
+        return _all(
+            conn,
+            "SELECT * FROM lot_bands WHERE symbol = '*' ORDER BY min_balance, max_balance",
         )
 
 
-def delete_margin(symbol: str) -> None:
+def add_lot_band(symbol: str, min_balance: float, max_balance: float, lots: int) -> None:
     key = _symbol_key(symbol)
-    if key == "*":
-        return
+    low = float(min_balance)
+    high = float(max_balance)
+    count = int(lots)
+    if low < 0 or high < low or count < 1:
+        raise ValueError("Set a minimum, a maximum at least that high, and at least 1 lot.")
     with connect() as conn:
-        conn.execute("DELETE FROM margin_rules WHERE symbol = ?", (key,))
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute(
+                "SELECT min_balance, max_balance FROM lot_bands WHERE symbol = ?", (key,)
+            ).fetchall()
+            for row in rows:
+                if ranges_overlap(low, high, float(row[0]), float(row[1])):
+                    raise RangeOverlap(key, float(row[0]), float(row[1]))
+            conn.execute(
+                "INSERT INTO lot_bands (symbol, min_balance, max_balance, lots) VALUES (?, ?, ?, ?)",
+                (key, low, high, count),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
 
-def rupees_per_lot(symbol: str) -> float:
-    """Rupees of cash required for one lot. A named row wins; otherwise `*`."""
-    key = _symbol_key(symbol)
+def delete_lot_band(band_id: int) -> None:
     with connect() as conn:
-        row = None
-        if key != "*":
-            row = _one(conn, "SELECT rupees_per_lot FROM margin_rules WHERE symbol = ?", (key,))
-        if row is None:
-            row = _one(conn, "SELECT rupees_per_lot FROM margin_rules WHERE symbol = '*'", ())
-    if row is None:
-        return 50000.0 if key in ("NIFTY", "SENSEX", "BANKNIFTY") else 100000.0
-    return float(row["rupees_per_lot"])
+        conn.execute("DELETE FROM lot_bands WHERE id = ?", (int(band_id),))
 
 
 def slippage_rules() -> List[dict]:

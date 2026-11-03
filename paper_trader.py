@@ -74,6 +74,32 @@ def _lots(n: int) -> str:
     return f"{n} lot{'s' if n != 1 else ''}"
 
 
+def one_lot_rows(rows: list) -> list:
+    """The same trades, with profit or loss for a single lot and no order costs."""
+    scaled = []
+    for row in rows:
+        item = dict(row)
+        try:
+            lots = int(float(item.get("lots") or 1))
+        except (TypeError, ValueError):
+            lots = 1
+        lots = max(1, lots)
+        gross = round(_money_num(item.get("gross_pnl")) / lots, 2)
+        item["lots"] = 1
+        item["gross_pnl"] = gross
+        item["costs"] = 0
+        item["pnl"] = gross
+        scaled.append(item)
+    return scaled
+
+
+def _money_num(value) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 @dataclass
 class Quote:
     ltp: float
@@ -207,11 +233,13 @@ def _portion(lots: int, pct: float) -> int:
 
 class PaperTrader:
     def __init__(self, gateway: KiteGateway, instruments: InstrumentMaster, notify: Notify,
-                 copy: Optional[Callable[[CopyEvent], None]] = None) -> None:
+                 copy: Optional[Callable[[CopyEvent], None]] = None,
+                 on_closed: Optional[Callable[[Position], None]] = None) -> None:
         self.gw = gateway
         self.instruments = instruments
         self.notify = notify
         self.copy = copy
+        self.on_closed = on_closed
         self.lock = threading.RLock()
         self.positions: Dict[str, Position] = {}
         self.ledger = PerformanceLedger()
@@ -900,7 +928,13 @@ class PaperTrader:
                 writer.writerow(row)
         except OSError as exc:
             log.error("Could not write the trade journal: %s", exc)
+            return
         self.ledger.refresh()
+        if self.on_closed:
+            try:
+                self.on_closed(pos)
+            except Exception:
+                log.exception("Could not send the trades file")
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Messages

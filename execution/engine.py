@@ -9,7 +9,7 @@ If the process dies after the call and before the fill is recorded, recovery
 looks the order up by tag and will not send it again.
 
 Buys are limit + IOC at the admin slippage cap, so a late copy does not
-chase. Lot size is the account cash divided by the admin rupee amount.
+chase. Lot size is the balance range the account cash falls in.
 Cash already in a position is not subtracted, so one trade does not shrink
 the next. When that buy fills, a sell stop-market rests at the broker at the
 signal stop (or the 30% default). A later stop message modifies it. An exit
@@ -32,7 +32,7 @@ from core.crypto import decrypt
 from core.logging_setup import get
 from execution import store
 from execution.events import CopyEvent
-from execution.risk import lots_for_balance, plan_buy, round_tick, sell_lots
+from execution.risk import lot_range_reason, lots_for_balance, plan_buy, round_tick, rupees_from_pct, sell_lots
 
 log = get("copy")
 
@@ -106,8 +106,11 @@ def buy_block_reason(account: dict) -> str:
 
 
 class CopyEngine:
-    def __init__(self, notify: Optional[Notify] = None, broker_factory=None) -> None:
+    def __init__(self, notify: Optional[Notify] = None, broker_factory=None,
+                 notify_account=None) -> None:
         self.notify = notify or (lambda text: None)
+        # (account, text). When set, account trade updates go there instead of notify.
+        self.notify_account = notify_account
         self.broker_factory = broker_factory or build_broker
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -152,12 +155,12 @@ class CopyEngine:
         if not accounts:
             return
         workers = min(16, len(accounts))
-        results: List[Result] = []
+        pairs = []
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="copy") as pool:
             futures = [pool.submit(self._safe, account, event) for account in accounts]
-            for future in futures:
-                results.append(future.result())
-        self._report(event, results)
+            for account, future in zip(accounts, futures):
+                pairs.append((account, future.result()))
+        self._report(event, pairs)
 
     def recover(self, positions: list) -> None:
         """Finish intents left mid-flight, and catch a crash around a fill."""
@@ -224,10 +227,10 @@ class CopyEngine:
             except (BrokerError, TransientError, TypeError, ValueError) as exc:
                 reason = f"could not read the account balance ({exc})"
             else:
-                per = store.rupees_per_lot(event.symbol)
-                sized = lots_for_balance(balance, per)
+                bands = store.lot_bands_for(event.symbol)
+                sized = lots_for_balance(balance, bands)
                 if sized < 1:
-                    reason = f"balance {_inr(balance)} is below {_inr(per)} for 1 {event.symbol or 'symbol'} lot"
+                    reason = lot_range_reason(balance, event.symbol or "symbol", bands)
                 else:
                     slip = store.effective_slippage(event.symbol)
                     plan = plan_buy(
@@ -242,7 +245,7 @@ class CopyEngine:
                         multiplier=event.multiplier,
                         lot_size=event.lot_size,
                         max_loss_trade=_num(account.get("max_loss_trade")),
-                        max_loss_day=_num(account.get("max_loss_day")),
+                        max_loss_day=rupees_from_pct(balance, _num(account.get("max_loss_day_pct"))),
                         day_realized=store.day_realized(account["id"]),
                         default_sl_pct=float(config.TRADE["default_sl_pct"]),
                     )
@@ -290,6 +293,17 @@ class CopyEngine:
         if board > 1:
             return plan.lots * board
         return plan.quantity
+
+    def _loss_balance(self, account: dict) -> float:
+        """Cash the daily loss percent is applied to. Paper uses the saved balance."""
+        if account.get("mode") != "live":
+            return max(0.0, float(account.get("paper_balance") or 0))
+        for exchange in ("NFO", "MCX"):
+            try:
+                return self._cash_balance(account, exchange)
+            except (BrokerError, TransientError, TokenError, TypeError, ValueError):
+                continue
+        return 0.0
 
     def _cash_balance(self, account: dict, exchange: str) -> float:
         """Paper uses the saved balance. Live reads broker cash and does not
@@ -349,9 +363,10 @@ class CopyEngine:
         row = _intent_row(key, account, event, "SELL", event.lots, 0, 0.0, "MARKET", reason)
         row["status"] = "WAITING"
         if store.claim_intent(row):
-            self.notify(
+            self._tell(
+                account,
                 f"⏳ Exit waiting · {_esc(self._name(account))} · {_esc(event.tradingsymbol)}\n"
-                "The stop is not confirmed yet, so no market sell was sent. I will keep trying."
+                "The stop is not confirmed yet, so no market sell was sent. I will keep trying.",
             )
             return
         existing = store.intent_by_key(key)
@@ -567,7 +582,7 @@ class CopyEngine:
             store.update_intent(claimed["id"], status="REJECTED", last_error=str(exc), reason=str(exc))
             store.set_leg_stop(account["id"], intent["position_id"], "", trigger, 0, claimed["tag"], "FAILED")
             if announce:
-                self.notify(f"⚠️ Stop rejected · {_esc(self._name(account))} · {_esc(leg['tradingsymbol'])}\n{ _esc(str(exc))}")
+                self._tell(account, f"⚠️ Stop rejected · {_esc(self._name(account))} · {_esc(leg['tradingsymbol'])}\n{ _esc(str(exc))}")
             return
         except TransientError as exc:
             store.update_intent(claimed["id"], status="UNKNOWN", last_error=str(exc))
@@ -582,7 +597,7 @@ class CopyEngine:
                                 broker_order_id=view.order_id, last_error=view.message)
             store.set_leg_stop(account["id"], intent["position_id"], "", trigger, 0, claimed["tag"], "FAILED")
             if announce:
-                self.notify(f"⚠️ Stop rejected · {_esc(self._name(account))} · {_esc(leg['tradingsymbol'])}\n"
+                self._tell(account, f"⚠️ Stop rejected · {_esc(self._name(account))} · {_esc(leg['tradingsymbol'])}\n"
                             f"{_esc(view.message or 'rejected')}")
             return
         if view.status == "UNKNOWN":
@@ -709,17 +724,23 @@ class CopyEngine:
     def _check_day_loss(self, account: dict) -> None:
         if account.get("kill_switch"):
             return
-        limit = _num(account.get("max_loss_day"))
-        if not account.get("auto_kill") or limit is None:
+        pct = _num(account.get("max_loss_day_pct"))
+        if not account.get("auto_kill") or pct is None:
+            return
+        balance = self._loss_balance(account)
+        limit = rupees_from_pct(balance, pct)
+        if limit is None:
             return
         realized = store.day_realized(account["id"])
         if realized > -limit:
             return
         store.set_kill(account["id"], True, "max loss per day")
         account["kill_switch"] = 1
-        self.notify(
+        self._tell(
+            account,
             f"🛑 <b>Kill switch</b> · {_esc(self._name(account))}\n"
-            f"Day P&amp;L is {realized:,.0f}, past the {limit:,.0f} loss limit. New buys are stopped."
+            f"Day P&amp;L is {realized:,.0f}, past {pct:g}% of {_inr(balance)} ({_inr(limit)}). "
+            "New buys are stopped.",
         )
         if account.get("flatten_on_kill"):
             self.flatten_account(account["id"])
@@ -808,9 +829,10 @@ class CopyEngine:
             already = intent.get("status") == "AUTH"
             store.update_intent(intent["id"], status="AUTH", last_error=str(exc))
             if not already:
-                self.notify(
+                self._tell(
+                    account,
                     f"⚠️ Login required · {_esc(self._name(account))} · {_esc(intent.get('tradingsymbol') or '')}\n"
-                    "The order was sent. Log in on the portal so I can confirm it."
+                    "The order was sent. Log in on the portal so I can confirm it.",
                 )
             return
         except (TransientError, BrokerError):
@@ -839,10 +861,11 @@ class CopyEngine:
             return
         store.update_intent(intent["id"], status="UNKNOWN", reason="UNCONFIRMED",
                             last_error="no matching broker order yet")
-        self.notify(
+        self._tell(
+            account,
             f"⚠️ Order not confirmed · {_esc(self._name(account))} · {_esc(intent.get('tradingsymbol') or '')}\n"
             f"No matching {intent.get('action') or 'order'} in the order book. "
-            "A second copy was not sent. I will keep checking."
+            "A second copy was not sent. I will keep checking.",
         )
 
     def _give_up_missing_stop(self, account: dict, intent: dict) -> None:
@@ -877,10 +900,13 @@ class CopyEngine:
                 else:
                     if latest and latest.get("last_error") != "STOP GAVE UP":
                         store.update_intent(latest["id"], last_error="STOP GAVE UP")
-                        self.notify(
-                            f"⚠️ Stop rejected 3 times · {_esc(leg.get('tradingsymbol') or '')}\n"
-                            "This account is open with no broker stop. Exit it from the signal if you want it closed."
-                        )
+                        owner = store.get_account(leg["account_id"])
+                        if owner is not None:
+                            self._tell(
+                                owner,
+                                f"⚠️ Stop rejected 3 times · {_esc(self._name(owner))} · {_esc(leg.get('tradingsymbol') or '')}\n"
+                                "This account is open with no broker stop. Exit it from the signal if you want it closed.",
+                            )
                     continue
             if _age(leg.get("updated_at") or "") < _STOP_RETRY_SEC:
                 continue
@@ -899,9 +925,10 @@ class CopyEngine:
                     }, float(fresh["sl_trigger"]), int(fresh["quantity_open"]), announce=False)
                     kept = store.get_leg(account["id"], leg["position_id"]) or {}
                     if kept.get("sl_status") == "WORKING":
-                        self.notify(
+                        self._tell(
+                            account,
                             f"✅ Stop is working · {_esc(self._name(account))} · {_esc(fresh['tradingsymbol'])}\n"
-                            f"{float(kept.get('sl_trigger') or 0):,.2f}"
+                            f"{float(kept.get('sl_trigger') or 0):,.2f}",
                         )
             except Exception:
                 log.exception("Could not replace a rejected stop for %s", leg.get("tradingsymbol"))
@@ -932,18 +959,20 @@ class CopyEngine:
             if not stale:
                 return
             store.update_intent(inflight["id"], status="FAILED", reason="order book never showed it")
-            self.notify(
+            self._tell(
+                account,
                 f"⚠️ Exit never showed at the broker · {_esc(self._name(account))} · {_esc(pos.tradingsymbol)}\n"
-                "Sending it again."
+                "Sending it again.",
             )
         result = self._safe(
             account,
             _event_from_position(pos, "SELL", int(leg["lots_open"]), int(leg["lots_open"]), "RECOVERY"),
         )
         if result.notify:
-            self.notify(
+            self._tell(
+                account,
                 f"<b>Copy SELL</b> · {_esc(pos.tradingsymbol)} · recovery\n"
-                f"• {_esc(result.label)} · {result.status} · {_esc(result.detail)}"
+                f"• {_esc(result.label)} · {result.status} · {_esc(result.detail)}",
             )
 
     def _recover_book(self, positions: list) -> None:
@@ -960,15 +989,23 @@ class CopyEngine:
                     self._safe(account, _event_from_position(pos, "BUY", pos.lots, pos.lots, "RECOVERY"))
         self.catch_up(positions)
 
-    def _report(self, event: CopyEvent, results: List[Result]) -> None:
-        shown = [item for item in results if item.notify]
-        if not shown:
-            return
+    def _report(self, event: CopyEvent, pairs: list) -> None:
+        """One message per account, for that account's owner."""
         verb = "BUY" if event.action == "BUY" else "SELL"
-        lines = [f"<b>Copy {verb}</b> · {_esc(event.tradingsymbol)} · {event.reason}"]
-        for item in shown:
-            lines.append(f"• {_esc(item.label)} · {item.status} · {_esc(item.detail)}")
-        self.notify("\n".join(lines))
+        for account, item in pairs:
+            if not item.notify:
+                continue
+            self._tell(
+                account,
+                f"<b>Copy {verb}</b> · {_esc(event.tradingsymbol)} · {_esc(event.reason)}\n"
+                f"• {_esc(item.label)} · {item.status} · {_esc(item.detail)}",
+            )
+
+    def _tell(self, account: dict, text: str) -> None:
+        if self.notify_account is not None:
+            self.notify_account(account, text)
+            return
+        self.notify(text)
 
     def _account_lock(self, account_id: int) -> threading.Lock:
         with self._guard:

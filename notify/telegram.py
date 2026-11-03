@@ -5,8 +5,10 @@ Two groups:
 
     signal group    your calls and exit / SL replies are read from here.
                     The bot never posts in it.
-    update group    every bot message goes here: entries, exits, SL changes,
+    update group    the signal book posts here: entries, exits, SL changes,
                     refusals, errors.
+    owner chat      a linked account's own trade update goes to the chat id
+                    saved on that account's owner.
 
 Reading is getUpdates long polling. Sending runs on a background worker, so
 a slow Telegram call never delays a stop-loss check.
@@ -153,10 +155,17 @@ class TelegramClient:
         self._worker = None
 
     def send(self, text: str, reply_to: Optional[str] = None,
-             on_sent: Optional[Callable[[str], None]] = None) -> None:
-        """reply_to is a ref() in either group; on_sent gets the new message's ref."""
+             on_sent: Optional[Callable[[str], None]] = None,
+             chat_id: Optional[str] = None) -> None:
+        """reply_to is a ref() in either group; on_sent gets the new message's ref.
+
+        chat_id sends to that chat. Without it, the message goes to the update group.
+        """
         try:
-            self._queue.put_nowait({"text": text, "reply_to": reply_to, "on_sent": on_sent})
+            self._queue.put_nowait({
+                "text": text, "reply_to": reply_to, "on_sent": on_sent,
+                "chat_id": str(chat_id or self.update_chat),
+            })
         except queue.Full:
             log.error("telegram queue full — message dropped: %s", text[:80])
 
@@ -176,10 +185,11 @@ class TelegramClient:
             except queue.Empty:
                 continue
             self._throttle()
-            message_id = self._post(item["text"], item["reply_to"], item.get("document"))
+            chat_id = item.get("chat_id") or self.update_chat
+            message_id = self._post(item["text"], item["reply_to"], item.get("document"), chat_id)
             if message_id and item["on_sent"]:
                 try:
-                    item["on_sent"](ref(self.update_chat, message_id))
+                    item["on_sent"](ref(chat_id, message_id))
                 except Exception as exc:
                     log.error("on_sent callback failed: %s", exc)
             self._queue.task_done()
@@ -203,9 +213,11 @@ class TelegramClient:
         return json.dumps(params)
 
     def _post(self, text: str, reply_to: Optional[str],
-              document: Optional[Tuple[str, bytes]] = None) -> Optional[int]:
+              document: Optional[Tuple[str, bytes]] = None,
+              chat_id: Optional[str] = None) -> Optional[int]:
+        target = str(chat_id or self.update_chat)
         for attempt in range(config.NOTIFY["retry_attempts"]):
-            params: Dict[str, Any] = {"chat_id": self.update_chat, "parse_mode": "HTML"}
+            params: Dict[str, Any] = {"chat_id": target, "parse_mode": "HTML"}
             if document is None:
                 params.update({"text": text[:MAX_LEN], "disable_web_page_preview": "true"})
             elif text:
@@ -219,8 +231,9 @@ class TelegramClient:
                 return int(result.get("message_id") or 0) or None
             except TelegramError as exc:
                 migrated = exc.parameters.get("migrate_to_chat_id")
-                if migrated:
+                if migrated and target == self.update_chat:
                     self.migrated(self.update_chat, str(migrated))
+                    target = self.update_chat
                     continue
                 if exc.code == 429:
                     time.sleep(float(exc.parameters.get("retry_after") or 3))

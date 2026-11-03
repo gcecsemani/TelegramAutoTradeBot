@@ -4,7 +4,7 @@ execution/risk.py
 Pure sizing rules. No broker and no database, so a bad limit is refused
 before an order exists.
 
-    lots            balance ÷ rupees per lot, then clamped into [min_lots, max_lots]
+    lots            the balance range that contains this cash, both ends included
     slippage        buy limit = reference + points, or reference + percent
     max loss/trade  drops the lot count so (entry - SL) × lots stays inside it
     max loss/day    same, using the loss budget still left today
@@ -27,16 +27,68 @@ class BuyPlan:
     reason: str
 
 
-def lots_for_balance(balance: float, rupees_per_lot: float) -> int:
-    """How many lots this cash pays for. Rounded down. Open positions are not an input."""
+def lots_for_balance(balance: float, bands: list) -> int:
+    """Lots for the range that contains this cash. Both ends count.
+
+    A balance in no range is 0. Open positions are not an input. When two
+    ranges share an endpoint, that rupee stays with the range that ends there.
+    A gap of at most ₹1 between two ranges uses the higher one, so a paisa
+    between ₹50,000 and ₹50,001 is not dropped.
+    """
     try:
         cash = float(balance)
-        per = float(rupees_per_lot)
     except (TypeError, ValueError):
         return 0
-    if cash <= 0 or per <= 0:
+    parsed = _parse_bands(bands)
+    if not parsed or cash < 0:
         return 0
-    return int(cash // per)
+    containing = [band for band in parsed if band[0] <= cash <= band[1]]
+    if containing:
+        containing.sort(key=lambda band: (band[1], -band[0]))
+        return containing[0][2]
+    for index, band in enumerate(parsed[:-1]):
+        nxt = parsed[index + 1]
+        if band[1] < cash < nxt[0] and nxt[0] - band[1] <= 1:
+            return nxt[2]
+    return 0
+
+
+def lot_range_reason(balance: float, symbol: str, bands: list) -> str:
+    """Why this cash took no lots. Used when lots_for_balance returns 0."""
+    name = symbol or "symbol"
+    parsed = _parse_bands(bands)
+    if not parsed:
+        return f"no lot range is set for {name}"
+    try:
+        cash = float(balance)
+    except (TypeError, ValueError):
+        cash = 0.0
+    lowest = min(band[0] for band in parsed)
+    highest = max(band[1] for band in parsed)
+    if cash < lowest:
+        return f"balance {_inr(cash)} is below {_inr(lowest)} for a {name} lot"
+    if cash > highest:
+        return f"balance {_inr(cash)} is above {_inr(highest)} for the {name} lot ranges"
+    return f"balance {_inr(cash)} is between the {name} lot ranges"
+
+
+def _parse_bands(bands: list) -> list:
+    parsed = []
+    for band in bands or []:
+        try:
+            low = float(band["min_balance"])
+            high = float(band["max_balance"])
+            lots = int(band["lots"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if lots >= 1 and high >= low:
+            parsed.append((low, high, lots))
+    parsed.sort(key=lambda band: (band[0], band[1]))
+    return parsed
+
+
+def _inr(amount: float) -> str:
+    return f"₹{float(amount):,.0f}"
 
 
 def round_tick(price: float, tick: float) -> float:
@@ -57,6 +109,20 @@ def buy_limit(price: float, mode: str, value: float, tick: float) -> float:
     else:
         raw = price * (1 + max(0.0, float(value)) / 100.0)
     return round_tick(max(raw, price), tick)
+
+
+def rupees_from_pct(balance: float, pct: float | None) -> float | None:
+    """Rupees equal to this percent of cash. Blank or zero percent is no limit."""
+    if pct is None:
+        return None
+    try:
+        cash = float(balance)
+        rate = float(pct)
+    except (TypeError, ValueError):
+        return None
+    if cash <= 0 or rate <= 0:
+        return None
+    return cash * rate / 100.0
 
 
 def plan_buy(

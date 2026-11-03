@@ -63,11 +63,23 @@ class RiskTests(unittest.TestCase):
         )
         self.assertFalse(plan.ok)
 
-    def test_balance_sets_lots_without_looking_at_open_positions(self):
-        self.assertEqual(lots_for_balance(50000, 50000), 1)
-        self.assertEqual(lots_for_balance(149999, 50000), 2)
-        self.assertEqual(lots_for_balance(200000, 100000), 2)
-        self.assertEqual(lots_for_balance(49999, 50000), 0)
+    def test_balance_sets_lots_from_the_range_it_falls_in(self):
+        bands = [
+            {"min_balance": 35000, "max_balance": 50000, "lots": 1},
+            {"min_balance": 50001, "max_balance": 100000, "lots": 2},
+        ]
+        self.assertEqual(lots_for_balance(35000, bands), 1)
+        self.assertEqual(lots_for_balance(50000, bands), 1)
+        self.assertEqual(lots_for_balance(50000.4, bands), 2)
+        self.assertEqual(lots_for_balance(100000, bands), 2)
+        self.assertEqual(lots_for_balance(34999, bands), 0)
+        self.assertEqual(lots_for_balance(100001, bands), 0)
+        touching = [
+            {"min_balance": 35000, "max_balance": 50000, "lots": 1},
+            {"min_balance": 50000, "max_balance": 100000, "lots": 2},
+        ]
+        self.assertEqual(lots_for_balance(50000, touching), 1)
+        self.assertEqual(lots_for_balance(50000.01, touching), 2)
 
     def test_broker_cash_ignores_margin_already_in_use(self):
         margins = {
@@ -122,6 +134,16 @@ class FanoutTests(unittest.TestCase):
         config.LIVE_TRADING = self._live
         shutil.rmtree(self.tmp, ignore_errors=True)
 
+    def test_copy_updates_go_to_the_owner_chat(self):
+        sent = []
+        self.engine.notify_account = lambda account, text: sent.append((account.get("owner_telegram"), text))
+        store.set_telegram_chat(self.user, "555001")
+        self.engine.handle(_event())
+        self.assertEqual(self.notes, [])
+        self.assertEqual({chat for chat, _text in sent}, {"555001"})
+        self.assertTrue(any("Copy BUY" in text and "FILLED" in text for _chat, text in sent))
+        self.assertTrue(any("kill switch" in text for _chat, text in sent))
+
     def test_one_account_fills_and_a_killed_account_does_not(self):
         self.engine.handle(_event())
         buys = [row for row in store.recent_intents(self.user) if row["action"] == "BUY"]
@@ -146,7 +168,7 @@ class FanoutTests(unittest.TestCase):
         self.assertGreater(store.day_realized(self.one), 0)
 
     def test_a_day_loss_trips_the_kill_switch(self):
-        store.update_account(self.one, self.user, {"max_loss_day": 200, "auto_kill": 1})
+        store.update_account(self.one, self.user, {"max_loss_day_pct": 1, "auto_kill": 1})
         self.engine.handle(_event(sl=99))
         self.engine.handle(_event(action="SELL", lots=2, lots_before=2, price=90, sl=99, reason="SL HIT"))
         self.assertEqual(store.get_account(self.one)["kill_switch"], 1)
@@ -218,10 +240,53 @@ class FanoutTests(unittest.TestCase):
         self.assertEqual(store.get_leg(self.one, "pos-a")["lots_open"], 3)
 
         store.update_account(self.one, self.user, {"paper_balance": 40000})
+        self.engine.handle(_event(position_id="pos-band"))
+        band = store.buy_intent(self.one, "pos-band")
+        self.assertEqual(band["status"], "FILLED")
+        self.assertEqual(band["lots"], 1)
+
+        store.update_account(self.one, self.user, {"paper_balance": 30000})
         self.engine.handle(_event(position_id="pos-small"))
         skipped = store.buy_intent(self.one, "pos-small")
         self.assertEqual(skipped["status"], "SKIPPED")
-        self.assertIn("50,000", skipped["reason"])
+        self.assertIn("35,000", skipped["reason"])
+
+        store.update_account(self.one, self.user, {"paper_balance": 600000})
+        self.engine.handle(_event(position_id="pos-high"))
+        high = store.buy_intent(self.one, "pos-high")
+        self.assertEqual(high["status"], "SKIPPED")
+        self.assertIn("500,000", high["reason"])
+
+    def test_untouched_margin_amounts_become_balance_ranges(self):
+        with store.connect() as conn:
+            conn.execute("DELETE FROM lot_bands")
+            conn.execute("DELETE FROM margin_rules")
+            conn.executemany(
+                "INSERT INTO margin_rules (symbol, rupees_per_lot) VALUES (?, ?)",
+                (("NIFTY", 50000), ("SENSEX", 50000), ("BANKNIFTY", 50000), ("*", 100000)),
+            )
+        store.init()
+        nifty = store.lot_bands_for("NIFTY")
+        self.assertEqual(lots_for_balance(40000, nifty), 1)
+        self.assertEqual(lots_for_balance(50000, nifty), 1)
+        self.assertEqual(lots_for_balance(100000, store.lot_bands_for("CRUDEOIL")), 1)
+
+    def test_a_custom_rupee_amount_is_kept_as_ranges(self):
+        with store.connect() as conn:
+            conn.execute("DELETE FROM lot_bands")
+            conn.execute("DELETE FROM margin_rules")
+            conn.execute(
+                "INSERT INTO margin_rules (symbol, rupees_per_lot) VALUES ('NIFTY', 40000)"
+            )
+        store.init()
+        nifty = store.lot_bands_for("NIFTY")
+        self.assertEqual(lots_for_balance(35000, nifty), 0)
+        self.assertEqual(lots_for_balance(40000, nifty), 1)
+        self.assertEqual(lots_for_balance(80000, nifty), 2)
+        store.add_lot_band("GOLD", 700000, 800000, 2)
+        with self.assertRaises(store.RangeOverlap):
+            store.add_lot_band("GOLD", 750000, 900000, 3)
+        store.add_lot_band("GOLD", 800000, 900000, 3)
 
     def test_admin_slippage_is_percent_or_points_for_one_symbol(self):
         store.upsert_slippage("NIFTY", "POINTS", 1.5)

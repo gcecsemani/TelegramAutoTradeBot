@@ -93,21 +93,24 @@ class PortalTests(unittest.TestCase):
         quote = self.client.get("/quote")
         self.assertIn("Save today's quote token", quote.text)
         config_page = self.client.get("/config")
-        self.assertIn("Rupees for one lot", config_page.text)
+        self.assertIn("Balance ranges", config_page.text)
         self.assertIn("BANKNIFTY", config_page.text)
-        saved = self.client.post("/config/margin", data={
-            "csrf": _csrf(config_page.text), "symbol": "CRUDEOIL", "rupees_per_lot": "150000",
+        saved = self.client.post("/config/lot-band", data={
+            "csrf": _csrf(config_page.text), "symbol": "CRUDEOIL",
+            "min_balance": "120000", "max_balance": "180000", "lots": "1",
         }, follow_redirects=True)
         self.assertIn("CRUDEOIL", saved.text)
-        self.assertIn("150,000", saved.text)
+        self.assertIn("120,000", saved.text)
+        self.assertIn("180,000", saved.text)
+        overlap = self.client.post("/config/lot-band", data={
+            "csrf": _csrf(saved.text), "symbol": "CRUDEOIL",
+            "min_balance": "150000", "max_balance": "200000", "lots": "2",
+        }, follow_redirects=True)
+        self.assertIn("overlaps", overlap.text)
         slipped = self.client.post("/config/slippage", data={
-            "csrf": _csrf(saved.text), "symbol": "NIFTY", "slippage_mode": "POINTS", "slippage_value": "1.5",
+            "csrf": _csrf(overlap.text), "symbol": "NIFTY", "slippage_mode": "POINTS", "slippage_value": "1.5",
         }, follow_redirects=True)
         self.assertIn("1.5 points", slipped.text)
-        kept = self.client.post("/config/margin/delete", data={
-            "csrf": _csrf(slipped.text), "symbol": "*",
-        }, follow_redirects=True)
-        self.assertIn("default row stays", kept.text)
         self._login("ada@cca.com", "password1")
         hidden = self.client.get("/quote", follow_redirects=True)
         self.assertIn("Only the admin", hidden.text)
@@ -115,7 +118,7 @@ class PortalTests(unittest.TestCase):
         self.assertIn("Ben desk", opened.text)
         blocked = self.client.get("/config", follow_redirects=True)
         self.assertIn("Only the admin", blocked.text)
-        self.assertNotIn("Save lot amount", blocked.text)
+        self.assertNotIn("Save lot range", blocked.text)
 
     def test_a_new_api_key_clears_the_saved_login(self):
         from execution import store
@@ -131,8 +134,11 @@ class PortalTests(unittest.TestCase):
             "csrf": _csrf(page.text), "label": "Ada desk", "broker": "zerodha",
             "client_id": "AB1", "product": "MIS", "mode": "paper", "enabled": "1",
             "auto_kill": "1", "paper_balance": "100000", "api_key": "new-key",
+            "telegram_chat": "555001",
         }, follow_redirects=True)
         self.assertIn("Daily login", saved.text)
+        self.assertEqual(store.get_account(account_id)["owner_telegram"], "555001")
+        self.assertIn("555001", saved.text)
         fresh = store.get_account(account_id)
         self.assertEqual(fresh["access_token_enc"], "")
         self.assertEqual(fresh["token_date"], "")
