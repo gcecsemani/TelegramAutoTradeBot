@@ -29,10 +29,6 @@ TAGGED BUY (reply on a message that only names the option)
 
 FOLLOW-UP (a reply that tags the call, or the bot's message about it)
 
-    Buy Near 100 · Buy Above 100 · Buy CMP  while the call is still waiting, replace
-                                            that entry. Buy CMP buys now; Near / Above
-                                            buy when that rule is met. An open trade
-                                            is left as it is.
     SL 70                                   SL to 70
     SL to cost · SL at cost · SL at CTC · SL CTC      SL to the entry price
     No sl · Hero zero · Hero to Zero        no SL
@@ -310,24 +306,6 @@ def _contract_from(t: str) -> Tuple[Optional[BuyCall], str]:
     return BuyCall(symbol=symbol, strike=float(contract.group(1)),
                    opt_type="CE" if contract.group(2).startswith("C") else "PE",
                    mode="CMP"), ""
-
-
-def parse_entry_reply(text: str) -> Tuple[Optional[BuyCall], str]:
-    """A Buy Above / Near / CMP line with no contract of its own.
-
-    (call, "") when the reply is an entry. The contract is filled in by the
-    trade the reply is tagged to. (None, reason) for a broken entry, (None, "")
-    when the reply is not an entry.
-    """
-    found, error = _read_entry(normalize(text))
-    if error or found is None:
-        return None, error
-    mode, level, level_high, buy = found
-    call = BuyCall(symbol="", strike=0.0, opt_type="", mode=mode, level=level, level_high=level_high)
-    raw = normalize(text)
-    _apply_sl_targets(call, raw[:buy.start()] + " " + raw[buy.end():])
-    _apply_book(call, raw)
-    return call, ""
 
 
 def parse_tagged_buy(reply: str, tagged: str) -> Tuple[Optional[BuyCall], str]:

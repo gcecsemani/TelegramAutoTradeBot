@@ -11,7 +11,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import signal_parser  # noqa: E402
-from signal_parser import parse, parse_entry_reply  # noqa: E402
+from signal_parser import parse  # noqa: E402
 
 signal_parser.register_names(["BAJAJ-AUTO", "BANKNIFTY", "M&M", "RELIANCE"])
 
@@ -201,15 +201,6 @@ class TaggedBuyTests(unittest.TestCase):
             self.assertEqual((parsed.kind, parsed.from_tag, parsed.call.symbol, parsed.call.strike,
                               parsed.call.opt_type, parsed.call.mode, parsed.call.level),
                              ("BUY", True, "SENSEX", 72800, "PE", mode, level), text)
-
-    def test_entry_reply_needs_no_contract(self):
-        near, error = parse_entry_reply("buy near 100")
-        self.assertEqual(error, "")
-        self.assertEqual((near.mode, near.level, near.symbol), ("NEAR", 100.0, ""))
-        cmp, error = parse_entry_reply("Buy CMP\nSl 80\nTgt 120")
-        self.assertEqual((error, cmp.mode, cmp.sl, cmp.targets), ("", "CMP", 80.0, [120.0]))
-        self.assertIsNone(parse_entry_reply("SL 70")[0])
-        self.assertIn("Buy Above", parse_entry_reply("buy near")[1])
 
     def test_sl_and_targets_on_the_reply(self):
         parsed = parse("Buy CMP\nSl 80\nTgt 120 140", is_reply=True, tagged=WATCH)
