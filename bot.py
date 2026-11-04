@@ -99,22 +99,15 @@ class SignalBot:
             if expiry:
                 expiries.append(f"{symbol} {expiry.strftime('%d %b')}")
         lines = [
-            "🟢 <b>SIGNAL BOT ONLINE · PAPER</b>",
-            f"{clock.now().strftime('%d %b %Y %H:%M')} IST · Kite {esc(self.gw.profile_name)}",
+            "🟢 <b>ONLINE</b> · PAPER",
+            f"{clock.now().strftime('%d %b %H:%M')} IST · {esc(self.gw.profile_name)}",
             esc(self.copy_engine.status_line()),
-            "",
-            "Nearest expiries: " + esc(", ".join(expiries)),
-            f"Open / waiting trades restored: {restored}" if restored else "No open trades.",
+            esc(", ".join(expiries)) if expiries else "No expiries loaded.",
+            f"{restored} open" if restored else "No open trades.",
+            "/op · /pnl · /trades",
         ]
         if access:
-            lines += ["", f"⚠️ <b>I cannot read normal messages yet.</b>\n{esc(access)}"]
-        lines += ["", f"Reading calls from group {esc(', '.join(sorted(self.tg.signal_chats)))}: "
-                      f"Buy Above / Near / CMP, {config.TRADE['lots']} lots. "
-                      "Tag a watchlist line (SENSEX 72800 PE) with Buy Above 120 / Buy Near 110 / Buy CMP to take it. "
-                      "Tag a call (or my trade "
-                      "message here) with Exit, Book half, SL …, Tgt …, Buy again, Buy again Above / Near / CMP; "
-                      "send Exit all to close "
-                      "everything.", "Here: /op open positions · /pnl today's P&amp;L · /trades the trades file."]
+            lines.append(f"⚠️ Cannot read messages. {esc(access)}")
         self.notify("\n".join(lines))
 
     def run(self) -> None:
@@ -138,7 +131,7 @@ class SignalBot:
         self.trader.save()
         open_count = len(self.trader.active())
         tail = f"\n{open_count} open / waiting trade(s) resume when I restart." if open_count else ""
-        self.notify(f"🔴 <b>SIGNAL BOT STOPPED</b>\n{esc(self.stop_reason)}\n\n{self.trader.pnl_text()}{tail}")
+        self.notify(f"🔴 <b>STOPPED</b> · {esc(self.stop_reason)} · {self.trader.pnl_text()}{tail}")
         self.tg.stop()
         log.info("Stopped: %s", self.stop_reason)
 
@@ -201,9 +194,7 @@ class SignalBot:
             return
         self._quotes_down = True
         log.critical("Kite quote token expired")
-        self.notify("🚨 <b>Quote login expired.</b> Open <b>Quote login</b> in the portal, "
-                    "sign in to Zerodha, and paste the redirect URL. I keep reading Telegram "
-                    "and resume prices when that is saved. No restart.")
+        self.notify("🚨 <b>Quote login expired.</b> Paste the Zerodha redirect URL in the portal.")
 
     # ─── Telegram in ──────────────────────────────────────────────────────────
 
@@ -313,38 +304,48 @@ class SignalBot:
             pos = self.trader.find_by_message(reply_ref)
             if pos is not None and parsed.follow_up.buy_again and not fresh:
                 if age < IGNORE_AFTER_SEC:
-                    self.notify(f"⌛ <b>Not bought again</b> — your message is {age / 60:.0f} min old "
-                                f"(I was offline). Send it again if it is still valid.\n{_said(text)}", msg_ref)
+                    self.notify(f"⌛ <b>Not bought again</b> · {age / 60:.0f} min old. Send it again.", msg_ref)
             elif pos is not None:
                 self.trader.follow_up(pos, parsed.follow_up, msg_ref)
             elif fresh and in_signal:
-                self.notify("ℹ️ No trade is linked to the message you tagged. Tag the buy call itself "
-                            f"or my ✅ BOUGHT message.\n{_said(text)}", msg_ref)
+                self.notify("ℹ️ No trade is linked. Tag the buy call.", msg_ref)
             return
+        if reply_ref:
+            linked = self.trader.find_by_message(reply_ref)
+            entry = parsed
+            if linked is not None and linked.status in (OPEN, PENDING) and not (
+                    parsed.kind == "BUY" and parsed.from_tag):
+                # A tag on the bot's waiting note still carries the entry. The option is the open trade.
+                entry = parse(text, is_reply=True, tagged=f"{linked.symbol} {linked.strike:g} {linked.opt_type}")
+            if linked is not None and entry.kind == "BUY" and entry.from_tag and linked.status == PENDING:
+                if fresh:
+                    self.trader.revise_waiting(linked, entry.call, msg_ref)
+                elif age < IGNORE_AFTER_SEC:
+                    self.notify(f"⌛ <b>Not changed</b> · {age / 60:.0f} min old. Send it again.", msg_ref)
+                return
+            if linked is not None and entry.kind == "BUY" and entry.from_tag and linked.status == OPEN:
+                if fresh:
+                    self.notify(f"ℹ️ {esc(linked.label)} is still open. Exit it first.", msg_ref)
+                elif age < IGNORE_AFTER_SEC:
+                    self.notify(f"⌛ <b>Not taken</b> · {age / 60:.0f} min old. Send it again.", msg_ref)
+                return
         if not in_signal:
             return                      # the update group takes follow-ups and Exit all only
         if parsed.kind == "BUY":
             extra = []
             stored = text
             if parsed.from_tag:
-                pos = self.trader.find_by_message(reply_ref)
-                if pos is not None and pos.status in (OPEN, PENDING) and fresh:
-                    what = "still open" if pos.status == OPEN else "still waiting to buy"
-                    self.notify(f"ℹ️ {esc(pos.label)} is {what} on the message you tagged. "
-                                f"Exit it first, or send the full call as its own message.\n{_said(text)}", msg_ref)
-                    return
                 stored = parsed.call.as_text()
                 extra = [reply_ref]
             self._handle_call(parsed.call, msg_ref, stored, age, extra)
         elif parsed.kind == "INVALID" and fresh:
-            self.notify(f"❓ <b>Not taken</b> — {esc(parsed.error)}\n{_said(text)}", msg_ref)
+            self.notify(f"❓ <b>Not taken</b> · {esc(parsed.error)}", msg_ref)
 
     def _handle_call(self, call: BuyCall, msg_ref: str, text: str, age: float, extra_refs=()) -> None:
         if age > config.TRADE["max_signal_age_sec"]:
             log.info("   call is %.0f s old — not taken", age)
             if age < IGNORE_AFTER_SEC:
-                self.notify(f"⌛ <b>Not taken</b> — this call is {age / 60:.0f} min old "
-                            f"(I was offline). Repost it if it is still valid.\n{_said(text)}", msg_ref)
+                self.notify(f"⌛ <b>Not taken</b> · {age / 60:.0f} min old. Repost it.", msg_ref)
             return
         self.trader.open_call(call, msg_ref, text, extra_refs=extra_refs)
 
@@ -361,7 +362,7 @@ class SignalBot:
         if parsed.kind == "BUY":
             self._handle_call(parsed.call, msg_ref, text, age)
         elif parsed.kind == "INVALID":
-            self.notify(f"❓ <b>Not taken</b> — {esc(parsed.error)}\n{_said(text)}", msg_ref)
+            self.notify(f"❓ <b>Not taken</b> · {esc(parsed.error)}", msg_ref)
 
 
     def _command(self, command: str, msg_ref: str) -> None:
@@ -380,7 +381,7 @@ class SignalBot:
             except OSError:
                 rows, content = [], b""
             if not rows:
-                self.notify("📎 No closed trades yet — trades.csv is empty.", msg_ref)
+                self.notify("📎 No closed trades yet.", msg_ref)
                 return
             total = sum(float(row.get("pnl") or 0) for row in rows)
             first, last = rows[0]["exit_time"][:10], rows[-1]["exit_time"][:10]
@@ -388,9 +389,3 @@ class SignalBot:
                 f"trades_{clock.datestamp()}.csv", content,
                 f"📎 <b>trades.csv</b> · {len(rows)} closed trades · {esc(first)} → {esc(last)}\n"
                 f"Net P&amp;L {money(total)}", msg_ref)
-
-
-def _said(text: str) -> str:
-    """Your message, shortened, so a notice in the update group shows what it answers."""
-    line = " · ".join(part.strip() for part in text.strip().splitlines() if part.strip())
-    return f"<i>“{esc(line[:120])}{'…' if len(line) > 120 else ''}”</i>"

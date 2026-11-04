@@ -20,8 +20,8 @@ def at(year, month, day, hour, minute):
 
 class MarketHoursTests(unittest.TestCase):
     def test_weekdays_run_from_before_the_open_until_after_mcx(self):
-        self.assertFalse(should_run(at(2026, 11, 2, 8, 44)))    # Monday
-        self.assertTrue(should_run(at(2026, 11, 2, 8, 45)))
+        self.assertFalse(should_run(at(2026, 11, 2, 7, 59)))    # Monday
+        self.assertTrue(should_run(at(2026, 11, 2, 8, 0)))
         self.assertTrue(should_run(at(2026, 11, 2, 15, 40)))
         self.assertTrue(should_run(at(2026, 11, 2, 23, 50)))
         self.assertTrue(should_run(at(2026, 11, 3, 0, 9)))      # still Monday's session

@@ -235,6 +235,18 @@ class FanoutTests(unittest.TestCase):
         crude = store.buy_intent(self.one, "pos-crude")
         self.assertEqual(crude["limit_price"], 101.0)
 
+    def test_a_short_name_uses_the_same_slippage_row(self):
+        store.upsert_slippage("CRUDE", "POINTS", 2)
+        self.assertEqual(store.effective_slippage("CRUDEOIL"),
+                         {"slippage_mode": "POINTS", "slippage_value": 2.0})
+        self.engine.handle(_event(
+            position_id="pos-crude-alias", symbol="CRUDEOIL", exchange="MCX",
+            tradingsymbol="CRUDEOIL26NOV5200CE", lot_size=1, multiplier=100,
+        ))
+        crude = store.buy_intent(self.one, "pos-crude-alias")
+        self.assertEqual(crude["limit_price"], 102.0)
+        self.assertEqual(store.effective_slippage("NIFTY")["slippage_value"], 1.0)
+
     def test_a_live_account_sizes_from_broker_cash(self):
         class Funds:
             def cash_balance(self, exchange):

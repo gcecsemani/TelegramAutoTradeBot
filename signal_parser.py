@@ -10,12 +10,10 @@ BUY CALL (its own message)
     Buy Near 90        buy at any price up to 2.5% over 90
     Buy Near 100-105   buy at 105 or below (inside the range, or under it)
     Buy only 100       buy only when the ask is 100, with no band
-    Buy.100 · Buy. 100 same exact-price buy
     Buy CMP            buy at the current price
     Book near 130      once open, sell everything at 130 or above
     Book 50 near 130   once open, sell 50% at 130 or above
     Sl 80              optional
-    Tgt 120 140 160++  optional
 
 TAGGED BUY (reply on a message that only names the option)
 
@@ -23,20 +21,20 @@ TAGGED BUY (reply on a message that only names the option)
         ↳ Buy CMP                 buys that option at the current price
         ↳ Buy Above 120           same, with that entry
         ↳ Buy Near 110
-        ↳ Buy CMP / Sl 80 / Tgt 120   SL and targets on the reply are optional
+        ↳ Buy CMP / Sl 80         the SL on the reply is optional
 
     Buy Above and Buy Near need a price. The option comes from the tagged message.
+
+    The same reply on a call that is still waiting replaces that entry:
+        ↳ Buy Near 100 · Buy only 100 · Buy Above 100 · Buy CMP
 
 FOLLOW-UP (a reply that tags the call, or the bot's message about it)
 
     SL 70                                   SL to 70
-    SL to cost · SL at cost · SL at CTC · SL CTC      SL to the entry price
-    No sl · Hero zero · Hero to Zero        no SL
-    Exit · Book · Book full · Book fully · Ignore · Avoid · Cancel · Close · Sell · SL hit
+    Exit · Book · Book full · Book fully · Cancel
                                             exit every lot (or drop a call still waiting)
-    Book half · Book 50 · Book 50%          exit half the lots now
+    Book half · Book 50                     exit half the lots now
     Book near 130 · Book 50 near 130        sell all, or that percent, when price is at or above 130
-    Tgt 110 · Tgt 110 120 130 · Target 110 · Target 110 120 130    new targets
     Buy again                               the same call again, once the last one is closed
     Buy again Above 100 · Buy again Near 100 · Buy again CMP
                                             same call, but this entry instead of the original one
@@ -67,8 +65,7 @@ BUY_RANGE_RE = re.compile(
 BUY_ONLY_RE = re.compile(
     r"\bBUY\s*[:\-@]?\s*(?:"
     r"ONLY\s*[:\-@]?\s*(" + NUM + r")" + _END +
-    r"|(" + NUM + r")\s*ONLY\b" +
-    r"|\.\s*(" + NUM + r")" + _END +
+    r"|(" + NUM + r")\s*ONLY\b"
     r")"
 )
 BUY_RE = re.compile(r"\bBUY\s*[:\-@]?\s*(?:(ABOVE|NEAR)\s*[:\-@]?\s*(" + NUM + r")" + _END + r"|(CMP)\b)")
@@ -82,13 +79,11 @@ _BARE_BUY_PRICE_RE = re.compile(r"\bBUY\s*[:\-@]?\s*" + NUM + _END)
 SELL_RE = re.compile(r"\b(?:SELL|SHORT|WRITE)\b")
 
 SL_PRICE_RE = re.compile(r"\bSL\s*(?:TO|AT|@|:|-|=)?\s*(" + NUM + r")" + _END)
-SL_COST_RE = re.compile(r"\bSL\s*(?:TO|AT|@|:|-|=)?\s*(?:COST|CTC)\b")
-NO_SL_RE = re.compile(r"\bNO\s*SL\b|\bHERO\s*(?:TO\s*)?ZERO\b")
-TARGET_RE = re.compile(r"\b(?:TGT|TARGET)S?\s*[:\-=]?\s*(" + NUM + r"(?:\s*[/,\-]?\s*" + NUM + r")*)")
 
 EXIT_ALL_RE = re.compile(r"(?:EXIT|CLOSE)\s+ALL(?:\s+(?:POSITIONS?|TRADES?))?")
-BOOK_HALF_RE = re.compile(r"\bBOOK\s*(?:HALF|50\s*%?" + _END + r")")
-EXIT_RE = re.compile(r"\b(?:EXIT|BOOK|IGNORE|AVOID|CANCEL|CLOSE|SELL)\b|\bSL\s*HIT\b")
+BOOK_HALF_RE = re.compile(r"\bBOOK\s*(?:HALF|50(?!\s*%)" + _END + r")")
+BOOK_50_PCT_RE = re.compile(r"\bBOOK\s*50\s*%")
+EXIT_RE = re.compile(r"\b(?:EXIT|BOOK|CANCEL)\b")
 BUY_AGAIN_RE = re.compile(
     r"\bBUY\s*AGAIN"
     r"(?:"
@@ -212,13 +207,6 @@ def _symbol_before(text: str, start: int) -> Optional[str]:
     return None
 
 
-def _targets(text: str) -> List[float]:
-    m = TARGET_RE.search(text)
-    if not m:
-        return []
-    return sorted({float(v) for v in re.findall(NUM, m.group(1))})
-
-
 def parse_call(t: str) -> Tuple[Optional[BuyCall], str]:
     """(call, "") · (None, reason) for a broken call · (None, "") for anything else."""
     contracts = list(CONTRACT_RE.finditer(t))
@@ -234,7 +222,9 @@ def parse_call(t: str) -> Tuple[Optional[BuyCall], str]:
     if error:
         return None, error
     if found is None:
-        return None, "Write the entry as Buy Above 100, Buy Near 90, Buy Near 100-105, Buy only 100, Buy.100 or Buy CMP."
+        if re.search(r"\bBUY\s*\.\s*" + NUM, t):
+            return None, ""
+        return None, "Write the entry as Buy Above 100, Buy Near 90, Buy Near 100-105, Buy only 100 or Buy CMP."
     mode, level, level_high, buy = found
     call = BuyCall(symbol=symbol, strike=float(contract.group(1)),
                    opt_type="CE" if contract.group(2).startswith("C") else "PE",
@@ -258,14 +248,14 @@ def _read_entry(t: str):
         return ("RANGE", low, high, rng), ""
     only = BUY_ONLY_RE.search(t)
     if only:
-        level = float(only.group(1) or only.group(2) or only.group(3))
+        level = float(only.group(1) or only.group(2))
         if level <= 0:
             return None, "The buy level must be above 0."
         return ("ONLY", level, None, only), ""
     buy = BUY_RE.search(t)
     if buy is None:
         if _INCOMPLETE_ENTRY_RE.search(t) or _BARE_BUY_PRICE_RE.search(t) or re.search(r"\bBUY\s*[:\-@]?\s*ONLY\b", t):
-            return None, "Write the entry as Buy Above 100, Buy Near 90, Buy Near 100-105, Buy only 100, Buy.100 or Buy CMP."
+            return None, "Write the entry as Buy Above 100, Buy Near 90, Buy Near 100-105, Buy only 100 or Buy CMP."
         return None, ""
     level = float(buy.group(2)) if buy.group(2) else None
     if level is not None and level <= 0:
@@ -285,11 +275,10 @@ def _apply_book(call: BuyCall, text: str) -> None:
 
 def _apply_sl_targets(call: BuyCall, rest: str) -> None:
     sl = SL_PRICE_RE.search(rest)
-    if NO_SL_RE.search(rest) or (sl and float(sl.group(1)) == 0):
+    if sl and float(sl.group(1)) == 0:
         call.no_sl = True
     elif sl:
         call.sl = float(sl.group(1))
-    call.targets = _targets(rest)
 
 
 def _contract_from(t: str) -> Tuple[Optional[BuyCall], str]:
@@ -348,19 +337,17 @@ def parse_follow_up(t: str) -> Tuple[Optional[FollowUp], str]:
             return FollowUp(book_level=level, book_pct=100.0 if pct > 100 else pct), ""
         if re.search(r"\bBOOK\b", t) and re.search(r"\bNEAR\b", t):
             return None, "Write it as Book near 130 or Book 50 near 130."
+        if BOOK_50_PCT_RE.search(t):
+            return None, ""
         if BOOK_HALF_RE.search(t):
             return FollowUp(exit="HALF"), ""
         if EXIT_RE.search(t):
             return FollowUp(exit="FULL"), ""
-    fu = FollowUp(targets=_targets(t))
+    fu = FollowUp()
     price = SL_PRICE_RE.search(t)
-    if NO_SL_RE.search(t):
-        fu.sl = "NONE"
-    elif SL_COST_RE.search(t):
-        fu.sl = "COST"
-    elif price:
+    if price:
         fu.sl, fu.sl_value = ("NONE", 0.0) if float(price.group(1)) == 0 else ("PRICE", float(price.group(1)))
-    if fu.sl or fu.targets:
+    if fu.sl:
         return fu, ""
     return None, ""
 

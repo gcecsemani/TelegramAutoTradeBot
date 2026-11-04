@@ -1,7 +1,7 @@
 """
 paper_trader.py
 ===============
-Paper positions opened from Telegram calls: 2 lots, nearest expiry.
+Paper positions opened from Telegram calls: 1 lot, nearest expiry.
 
     entry   Buy CMP      buys now at the live ask.
             Buy Near X   buys once the ask is at most X + 2.5%. Lower is fine.
@@ -9,9 +9,11 @@ Paper positions opened from Telegram calls: 2 lots, nearest expiry.
                          at most X + 2.5%. If it has run further, it waits for
                          the premium to come back into that band.
             A call still waiting is dropped at the session square-off.
+            Tag it with Buy Near, Buy only, Buy Above or Buy CMP to change
+            that entry. It buys immediately when the new rule already fits.
     stop    exits every open lot at the bid when the LTP trades at or below
             the SL. No SL in the call → 30% under the fill until you send one.
-            "No sl" / "Hero zero" → no stop.
+            "SL 0" → no stop.
     exit    your Exit / Book … sells every open lot at the bid; Book half sells
             half of them (1 of 2).
     close   whatever is open is squared off at the session square-off.
@@ -341,7 +343,7 @@ class PaperTrader:
 
         def refuse(reason: str) -> None:
             log.info("Not taken (%s): %s", call.contract_text(), reason)
-            self.notify(f"❌ <b>Not taken</b> · {esc(call.contract_text())}\n{esc(reason)}", ref, None)
+            self.notify(f"❌ <b>Not taken</b> · {esc(call.contract_text())} · {esc(reason)}", ref, None)
 
         if not clock.is_open(exchange):
             refuse(f"{exchange} is closed now (session {clock.session_text(exchange)}, Mon–Fri).")
@@ -432,7 +434,7 @@ class PaperTrader:
             return False
         return pos.mode == "NEAR" or quote.ltp >= float(pos.level)
 
-    def _fill(self, pos: Position, quote: Quote) -> str:
+    def _fill(self, pos: Position, quote: Quote, reply_to: Optional[str] = None) -> str:
         """Buy every lot at the ask. Returns a refusal when the SL is already
         at or above the price."""
         price = _round_tick(quote.buy_price(), pos.tick_size)
@@ -445,7 +447,7 @@ class PaperTrader:
         else:
             pct = config.TRADE["default_sl_pct"]
             sl = _round_tick(price * (1 - pct / 100.0), pos.tick_size)
-            note = f"No SL in the call — {pct:g}% default used. Tag the call with SL … to change it."
+            note = f"No SL — {pct:g}% default."
 
         now = clock.now().isoformat()
         pos.status = OPEN
@@ -463,7 +465,7 @@ class PaperTrader:
             reason="ENTRY", signal_ref=pos.signal_ref,
             exact=pos.mode == "ONLY",
         ))
-        self._notify_opened(pos)
+        self._notify_opened(pos, reply_to)
         return ""
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -497,11 +499,7 @@ class PaperTrader:
             pos.book_level = level
             pos.book_pct = pct
             if pos.status == PENDING:
-                self.notify(
-                    f"📌 <b>Book armed</b> · {esc(pos.label)}\n"
-                    f"{esc(self._book_line(pos))} after the buy fills.",
-                    ref, pos.id,
-                )
+                self.notify(f"📌 <b>Book</b> · {esc(pos.label)} · {esc(self._book_line(pos))}", ref, pos.id)
                 return
         try:
             quote = self._quote(pos.key)
@@ -515,11 +513,7 @@ class PaperTrader:
                 self._book_at(pos, quote, ref)
                 return
             now = f"{quote.ltp:,.2f}" if quote else "unavailable"
-            self.notify(
-                f"📌 <b>Book armed</b> · {esc(pos.label)}\n"
-                f"{esc(self._book_line(pos))}. LTP now {now}.",
-                ref, pos.id,
-            )
+            self.notify(f"📌 <b>Book</b> · {esc(pos.label)} · {esc(self._book_line(pos))} · LTP {now}", ref, pos.id)
 
     def _book_at(self, pos: Position, quote: Quote, ref: str) -> bool:
         level = pos.book_level
@@ -543,7 +537,7 @@ class PaperTrader:
         that entry; a plain "Buy again" repeats the entry already on the call."""
         if pos.status in (OPEN, PENDING):
             what = "still open" if pos.status == OPEN else "still waiting to buy"
-            self.notify(f"ℹ️ {esc(pos.label)} is {what} — not bought again. Exit it first.", ref, pos.id)
+            self.notify(f"ℹ️ {esc(pos.label)} is {what}. Exit it first.", ref, pos.id)
             return
         parsed = parse_call(normalize(pos.signal_text))[0]
         call = parsed or BuyCall(symbol=pos.symbol, strike=pos.strike, opt_type=pos.opt_type,
@@ -556,10 +550,49 @@ class PaperTrader:
         log.info("Buy again on %s: %s", pos.tradingsymbol, call)
         self.open_call(call, ref, text, extra_refs=pos.refs)
 
+    def revise_waiting(self, pos: Position, call: BuyCall, ref: str) -> None:
+        """A tagged Buy Near / Buy only / Buy Above / Buy CMP replaces the entry while the call is waiting."""
+        if (call.symbol, call.opt_type, float(call.strike)) != (pos.symbol, pos.opt_type, float(pos.strike)):
+            self.notify(f"⚠️ {esc(pos.label)} still waiting. {esc(call.contract_text())} is a different option.",
+                        ref, pos.id)
+            return
+        with self.lock:
+            if pos.status != PENDING:
+                what = "still open" if pos.status == OPEN else ("closed" if pos.status == CLOSED else "cancelled")
+                self.notify(f"ℹ️ {esc(pos.label)} is {what}. Entry unchanged.", ref, pos.id)
+                return
+            pos.mode = call.mode
+            pos.level = call.level
+            pos.level_high = float(call.level_high or 0)
+            if call.book_level:
+                pos.book_level = float(call.book_level)
+                pos.book_pct = float(call.book_pct or 100)
+            if call.no_sl:
+                pos.sl, pos.no_sl = None, True
+            elif call.sl is not None:
+                pos.sl, pos.no_sl = call.sl, False
+            pos.signal_text = _signal_with_entry(pos.signal_text, call)[:500]
+            if ref and ref not in pos.refs:
+                pos.refs.append(ref)
+        try:
+            quote = self._quote(pos.key)
+        except Exception:
+            quote = None
+        with self.lock:
+            if pos.status != PENDING:
+                return
+            if quote and self._entry_ready(pos, quote):
+                error = self._fill(pos, quote, ref)
+                if error:
+                    self._cancel(pos, error, ref)
+            else:
+                shown = quote or Quote(pos.last_ltp or 0, 0, pos.last_ltp or 0)
+                self._notify_waiting(pos, shown, ref)
+        self.save()
+
     def _already_done(self, pos: Position, ref: str) -> None:
         what = "closed" if pos.status == CLOSED else "cancelled"
-        self.notify(f"ℹ️ {esc(pos.label)} is already {what}"
-                    f"{' (' + esc(pos.close_reason) + ')' if pos.close_reason else ''}.", ref, pos.id)
+        self.notify(f"ℹ️ {esc(pos.label)} is already {what}.", ref, pos.id)
 
     def _exit_on_reply(self, pos: Position, half: bool, ref: str) -> None:
         """Sell at once whatever the P&L — every lot, or half of them — or drop
@@ -602,26 +635,19 @@ class PaperTrader:
                 elif fu.sl == "PRICE":
                     pos.sl, pos.no_sl = fu.sl_value, False
                 else:
-                    self.notify(f"⚠️ {esc(pos.label)} is not bought yet — SL to cost "
-                                "works after the fill.", ref, pos.id)
+                    self.notify(f"⚠️ {esc(pos.label)} not bought yet.", ref, pos.id)
                     return
-                self.notify(f"🔧 SL for the waiting {esc(pos.label)} is now {esc(pos.sl_text())}. "
-                            "It applies when the entry fills.", ref, pos.id)
+                self.notify(f"🔧 <b>SL</b> · {esc(pos.label)} · {esc(pos.sl_text())}", ref, pos.id)
                 return
             if pos.status != OPEN:
                 self._already_done(pos, ref)
                 return
             if fu.sl == "NONE":
-                old = pos.sl_text()
                 pos.sl, pos.no_sl = None, True
-                self.notify(f"🔧 <b>SL removed</b> · {esc(pos.label)}\n{esc(old)} → <b>none (hero zero)</b>",
-                            ref, pos.id)
+                self.notify(f"🔧 <b>SL removed</b> · {esc(pos.label)}", ref, pos.id)
                 self._emit_stop(pos)
                 return
-            if fu.sl == "COST":
-                level, name = pos.entry_price, "cost"
-            else:
-                level, name = fu.sl_value, ""
+            level = pos.entry_price if fu.sl == "COST" else fu.sl_value
         quote = self._quote(pos.key)
         with self.lock:
             if pos.status != OPEN:
@@ -630,15 +656,13 @@ class PaperTrader:
             ltp = quote.ltp if quote else pos.last_ltp
             level = _round_tick(level, pos.tick_size)
             if level >= ltp:
-                self.notify(f"⚠️ SL not changed for {esc(pos.label)}: {level:,.2f} is not below the live "
-                            f"premium {ltp:,.2f}.\nSL stays {esc(pos.sl_text())}.", ref, pos.id)
+                self.notify(f"⚠️ SL not changed · {esc(pos.label)} · {level:,.2f} is not below the live "
+                            f"premium {ltp:,.2f}.", ref, pos.id)
                 return
             old = pos.sl_text()
             pos.sl, pos.no_sl = level, False
             log.info("SL %s: %s -> %.2f", pos.tradingsymbol, old, level)
-            self.notify(f"🔧 <b>SL moved{' to ' + name if name else ''}</b> · {esc(pos.label)}\n"
-                        f"{esc(old)} → <b>{level:,.2f}</b>\nLTP {ltp:,.2f} · entry {pos.entry_price:,.2f}",
-                        ref, pos.id)
+            self.notify(f"🔧 <b>SL</b> · {esc(pos.label)} · {esc(old)} → <b>{level:,.2f}</b>", ref, pos.id)
             self._emit_stop(pos)
 
     def _set_targets(self, pos: Position, targets: List[float], ref: str) -> None:
@@ -651,15 +675,14 @@ class PaperTrader:
             pos.targets_hit = [t for t in pos.targets if t <= reached]
             listed = " / ".join(f"{t:g}" for t in pos.targets)
             log.info("Targets %s: %s", pos.tradingsymbol, listed)
-            self.notify(f"🎯 <b>Targets set</b> · {esc(pos.label)}\n<b>{esc(listed)}</b>", ref, pos.id)
+            self.notify(f"🎯 <b>Targets</b> · {esc(pos.label)} · {esc(listed)}", ref, pos.id)
 
     def update_from_edit(self, pos: Position, call: BuyCall, ref: str, text: str = "") -> None:
         """You edited the call. The buy level (while waiting), SL and targets
         follow the edit, and so does a later "Buy again"."""
         if (call.symbol, call.opt_type, call.strike) != (pos.symbol, pos.opt_type, pos.strike):
             if pos.status in (OPEN, PENDING):
-                self.notify(f"⚠️ The edit changes the contract. {esc(pos.label)} is unchanged — "
-                            "tag it with Exit and post a new call.", ref, pos.id)
+                self.notify(f"⚠️ Edit changes the contract. {esc(pos.label)} unchanged.", ref, pos.id)
             return
         if text:
             pos.signal_text = text.strip()[:500]
@@ -674,8 +697,7 @@ class PaperTrader:
                 pos.book_pct = float(call.book_pct or 0) if call.book_level else 0.0
                 pos.sl, pos.no_sl = call.sl, call.no_sl
                 pos.targets = list(call.targets)
-                self.notify(f"✏️ Edit applied to the waiting {esc(pos.label)}: {esc(pos.entry_text())}, "
-                            f"SL {esc(pos.sl_text())}.", ref, pos.id)
+                self.notify(f"✏️ {esc(pos.label)} · {esc(pos.entry_text())} · SL {esc(pos.sl_text())}", ref, pos.id)
         else:
             if call.no_sl or call.sl is not None:
                 self._set_sl(pos, FollowUp(sl="NONE" if call.no_sl else "PRICE", sl_value=call.sl or 0.0), ref)
@@ -686,7 +708,7 @@ class PaperTrader:
     def exit_all(self, ref: str) -> None:
         active = self.active()
         if not active:
-            self.notify("ℹ️ Exit all — nothing is open.", ref, None)
+            self.notify("ℹ️ Exit all · nothing open.", ref, None)
             return
         try:
             quotes = self.quotes([p.key for p in active if p.status == OPEN])
@@ -706,8 +728,7 @@ class PaperTrader:
                                "" if quote else "No live quote — used the last traded price.")
                     closed += 1
         self.save()
-        self.notify(f"🧹 <b>Exit all done</b> · {closed} closed, {dropped} waiting call(s) dropped\n"
-                    f"{self.pnl_text()}", ref, None)
+        self.notify(f"🧹 <b>Exit all done</b> · {closed} closed, {dropped} waiting", ref, None)
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Monitor — called every second
@@ -786,11 +807,8 @@ class PaperTrader:
             if target not in pos.targets_hit and quote.ltp >= target:
                 pos.targets_hit.append(target)
                 changed = True
-                gain = (quote.ltp - pos.entry_price) * pos.lots * pos.multiplier
-                lines = [f"🎯 <b>Target {number} {target:g} reached</b> · {esc(pos.label)}",
-                         f"LTP {quote.ltp:,.2f} · open P&amp;L {money(gain)}"]
-                lines.append("Still open — tag the call with Book / Book half / SL … to act.")
-                self.notify("\n".join(lines), pos.signal_ref, pos.id)
+                self.notify(f"🎯 <b>Target {number} {target:g}</b> · {esc(pos.label)} · LTP {quote.ltp:,.2f}",
+                            pos.signal_ref, pos.id)
         return changed
 
     def _track_outage(self, ok: bool) -> None:
@@ -804,9 +822,7 @@ class PaperTrader:
         elif not self._quote_alerted and \
                 time.monotonic() - self._quote_fail_since > config.ENGINE["quote_outage_alert_sec"]:
             self._quote_alerted = True
-            self.notify("⚠️ No live quotes from Kite for a minute. Signal-book stop checks are paused "
-                        "until prices return. A stop already placed at a broker stays there.",
-                        None, None)
+            self.notify("⚠️ No live quotes. Stops paused.", None, None)
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Fills out
@@ -835,9 +851,8 @@ class PaperTrader:
 
         if pos.lots > 0:
             lines = [
-                f"🟨 <b>BOOKED {lots} OF {pos.initial_lots} LOTS · {esc(pos.label)}</b> · PAPER",
-                f"Sold {_lots(lots)} at {price:,.2f} (bought {pos.entry_price:,.2f}) → <b>{money(pnl)}</b>",
-                f"{_lots(pos.lots)} still open · SL {esc(pos.sl_text())}",
+                f"🟨 <b>BOOKED {lots} OF {pos.initial_lots} LOTS</b> · {esc(pos.label)} · "
+                f"{price:,.2f} · <b>{money(pnl)}</b> · {_lots(pos.lots)} left",
             ]
         else:
             pos.status = CLOSED
@@ -847,15 +862,11 @@ class PaperTrader:
             net = pos.gross - pos.cost_total
             title = reason if "SL HIT" in reason else "EXITED"
             lines = [
-                f"{'🟩' if net >= 0 else '🟥'} <b>{title} · {esc(pos.label)}</b> · PAPER",
-                esc(pos.close_reason),
-                "",
-                f"Bought {pos.entry_price:,.2f} → sold {pos.avg_exit:,.2f} × {_lots(pos.initial_lots)} "
-                f"({pos.initial_lots * pos.multiplier} qty)",
-                f"<b>P&amp;L {money(net)}</b> (costs ₹{pos.cost_total:,.0f})",
+                f"{'🟩' if net >= 0 else '🟥'} <b>{title}</b> · {esc(pos.label)} · "
+                f"{pos.entry_price:,.2f} → {pos.avg_exit:,.2f} · <b>P&amp;L {money(net)}</b>",
             ]
         if note:
-            lines.append(f"<i>{esc(note)}</i>")
+            lines.append(esc(note))
         self.notify("\n".join(lines), reply_to, pos.id)
         return True
 
@@ -864,8 +875,7 @@ class PaperTrader:
         pos.closed_at = clock.now().isoformat()
         pos.close_reason = reason
         log.info("Dropped waiting call %s: %s", pos.tradingsymbol, reason)
-        self.notify(f"🚫 <b>Call dropped</b> · {esc(pos.label)}\n{esc(reason)}. Nothing was bought.",
-                    reply_to, pos.id)
+        self.notify(f"🚫 <b>Dropped</b> · {esc(pos.label)} · {esc(reason)}", reply_to, pos.id)
 
     def _journal(self, pos: Position) -> None:
         path = config.PATHS["trade_journal"]
@@ -906,26 +916,20 @@ class PaperTrader:
     #  Messages
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _notify_opened(self, pos: Position) -> None:
-        targets = " / ".join(f"{t:g}" for t in pos.targets) or "—"
-        lines = [
-            f"✅ <b>BOUGHT {esc(pos.label)}</b> · PAPER",
-            f"{esc(pos.tradingsymbol)} · {esc(pos.entry_text())}",
-            "",
-            f"Entry <b>{pos.entry_price:,.2f}</b> × {_lots(pos.lots)} ({pos.lots * pos.multiplier} qty)",
-            f"SL <b>{esc(pos.sl_text())}</b> · Targets {esc(targets)}",
-        ]
+    def _notify_opened(self, pos: Position, reply_to: Optional[str] = None) -> None:
+        line = (f"✅ <b>BOUGHT {esc(pos.label)}</b> · {pos.entry_price:,.2f} × "
+                f"{_lots(pos.lots)} ({pos.lots * pos.multiplier} qty) · SL {esc(pos.sl_text())}")
         if pos.book_level > 0:
-            lines.append(self._book_line(pos))
+            line += f" · {esc(self._book_line(pos))}"
         if pos.sl_note:
-            lines.append(f"<i>{esc(pos.sl_note)}</i>")
-        self.notify("\n".join(lines), pos.signal_ref, pos.id)
+            line += f" · {esc(pos.sl_note)}"
+        self.notify(line, reply_to or pos.signal_ref, pos.id)
 
     def _book_line(self, pos: Position) -> str:
-        share = "everything" if pos.book_pct >= 100 else f"{pos.book_pct:g}%"
-        return f"Books {share} at {pos.book_level:g} or above"
+        share = "all" if pos.book_pct >= 100 else f"{pos.book_pct:g}%"
+        return f"book {share} at {pos.book_level:g}"
 
-    def _notify_waiting(self, pos: Position, quote: Quote) -> None:
+    def _notify_waiting(self, pos: Position, quote: Quote, reply_to: Optional[str] = None) -> None:
         if pos.mode == "ONLY":
             when = f"the ask is exactly {pos.level:g}"
         elif pos.mode == "RANGE":
@@ -937,13 +941,12 @@ class PaperTrader:
             else:
                 when = f"the premium is at or under {cap:,.2f}"
         lines = [
-            f"⏳ <b>WAITING · {esc(pos.label)}</b> · {esc(pos.entry_text())}",
-            f"Buys {_lots(pos.lots)} when {when} (LTP now {quote.ltp:,.2f})",
-            f"SL {esc(pos.sl_text())} · valid until today's square-off",
+            f"⏳ <b>WAITING</b> · {esc(pos.label)} · {esc(pos.entry_text())} · "
+            f"buys when {when} · LTP {quote.ltp:,.2f} · SL {esc(pos.sl_text())}",
         ]
         if pos.book_level > 0:
             lines.append(self._book_line(pos))
-        self.notify("\n".join(lines), pos.signal_ref, pos.id)
+        self.notify("\n".join(lines), reply_to or pos.signal_ref, pos.id)
 
     def pnl_text(self) -> str:
         today = clock.today().isoformat()

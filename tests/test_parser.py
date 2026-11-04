@@ -37,11 +37,11 @@ class BuyCallTests(unittest.TestCase):
     def test_sample_calls(self):
         cases = [
             ("NIFTY 22800PE\nBuy Above 100\nSl 80\nTgt 120 140 160++",
-             ("NIFTY", 22800, "PE", "ABOVE", 100, 80, False, [120, 140, 160])),
+             ("NIFTY", 22800, "PE", "ABOVE", 100, 80, False, [])),
             ("NIFTY 22800PE\nBuy Near 90\nSl 70\nTgt 110 130 150++",
-             ("NIFTY", 22800, "PE", "NEAR", 90, 70, False, [110, 130, 150])),
+             ("NIFTY", 22800, "PE", "NEAR", 90, 70, False, [])),
             ("NIFTY 22800PE\nBuy CMP\nSl 70\nTgt 110 130 150++",
-             ("NIFTY", 22800, "PE", "CMP", None, 70, False, [110, 130, 150])),
+             ("NIFTY", 22800, "PE", "CMP", None, 70, False, [])),
             ("NIFTY 22800PE\nBuy Above 100", ("NIFTY", 22800, "PE", "ABOVE", 100, None, False, [])),
             ("NIFTY 22800PE\nBuy Near 90", ("NIFTY", 22800, "PE", "NEAR", 90, None, False, [])),
             ("NIFTY 22800PE\nBuy CMP", ("NIFTY", 22800, "PE", "CMP", None, None, False, [])),
@@ -67,7 +67,7 @@ class BuyCallTests(unittest.TestCase):
         self.assertEqual(call("nifty 22800 pe\nbuy above 100\nsl 80\ntgt 120 140 160++")[3], "ABOVE")
 
     def test_no_sl_in_a_call(self):
-        self.assertTrue(call("NIFTY 22800PE\nBuy CMP\nHero zero")[6])
+        self.assertFalse(call("NIFTY 22800PE\nBuy CMP\nHero zero")[6])
         self.assertTrue(call("NIFTY 22800PE\nBuy CMP\nSl 0")[6])
 
     def test_everything_else_is_ignored(self):
@@ -99,8 +99,7 @@ class BuyCallTests(unittest.TestCase):
         parsed = parse("Nifty 22700 Pe buy @ 85 only")
         self.assertEqual((parsed.call.mode, parsed.call.level), ("ONLY", 85))
         for text in ("NIFTY 22800PE\nBuy.100", "NIFTY 22800PE\nBuy. 100", "NIFTY 22800PE\nbuy .100"):
-            parsed = parse(text)
-            self.assertEqual((parsed.kind, parsed.call.mode, parsed.call.level), ("BUY", "ONLY", 100), text)
+            self.assertEqual(parse(text).kind, "NONE", text)
         parsed = parse("NIFTY 22800PE\nbuy near 105-100")
         self.assertEqual((parsed.call.level, parsed.call.level_high), (100, 105))
 
@@ -124,18 +123,17 @@ class BuyCallTests(unittest.TestCase):
 class FollowUpTests(unittest.TestCase):
     def test_sl(self):
         self.assertEqual(follow("SL 70")[1:3], ("PRICE", 70))
-        for text in ("SL to cost", "SL at cost", "SL at CTC", "SL CTC"):
-            self.assertEqual(follow(text)[1], "COST", text)
-        for text in ("SL to t1", "SL to t2", "SL to t3"):
+        for text in ("SL to t1", "SL to t2", "SL to t3", "SL to cost", "SL at cost", "SL at CTC", "SL CTC",
+                     "No sl", "Hero zero", "Hero to Zero"):
             self.assertEqual(parse(text, is_reply=True).kind, "NONE", text)
-        for text in ("No sl", "Hero zero", "Hero to Zero"):
-            self.assertEqual(follow(text)[1], "NONE", text)
 
     def test_exits(self):
-        for text in ("Exit", "Book", "Ignore", "Avoid", "Cancel", "Close", "Sell", "SL hit", "Book full", "Book fully"):
+        for text in ("Exit", "Book", "Cancel", "Book full", "Book fully"):
             self.assertEqual(follow(text)[0], "FULL", text)
-        for text in ("Book half", "Book 50", "Book 50%"):
+        for text in ("Book half", "Book 50"):
             self.assertEqual(follow(text)[0], "HALF", text)
+        for text in ("Ignore", "Avoid", "Close", "Sell", "SL hit", "Book 50%"):
+            self.assertEqual(parse(text, is_reply=True).kind, "NONE", text)
         full = parse("book near 130", is_reply=True).follow_up
         self.assertEqual((full.exit, full.book_level, full.book_pct), ("", 130, 100))
         half = parse("book 50 near 130", is_reply=True).follow_up
@@ -143,11 +141,9 @@ class FollowUpTests(unittest.TestCase):
         self.assertEqual(parse("book 50% near 130", is_reply=True).follow_up.book_pct, 50)
         self.assertEqual(parse("book near", is_reply=True).kind, "INVALID")
 
-    def test_targets(self):
-        self.assertEqual(follow("Tgt 110")[3], [110])
-        self.assertEqual(follow("Tgt 110 120 130")[3], [110, 120, 130])
-        self.assertEqual(follow("Target 110")[3], [110])
-        self.assertEqual(follow("Target 110 120 130")[3], [110, 120, 130])
+    def test_targets_are_ignored(self):
+        for text in ("Tgt 110", "Tgt 110 120 130", "Target 110", "Target 110 120 130"):
+            self.assertEqual(parse(text, is_reply=True).kind, "NONE", text)
 
     def test_buy_again(self):
         for text in ("Buy again", "buy again", "BUY AGAIN 🔥"):
@@ -205,8 +201,8 @@ class TaggedBuyTests(unittest.TestCase):
     def test_sl_and_targets_on_the_reply(self):
         parsed = parse("Buy CMP\nSl 80\nTgt 120 140", is_reply=True, tagged=WATCH)
         call = parsed.call
-        self.assertEqual((parsed.kind, call.sl, call.no_sl, call.targets), ("BUY", 80, False, [120, 140]))
-        self.assertEqual(call.as_text(), "SENSEX 72800 PE\nBuy CMP\nSl 80\nTgt 120 140")
+        self.assertEqual((parsed.kind, call.sl, call.no_sl, call.targets), ("BUY", 80, False, []))
+        self.assertEqual(call.as_text(), "SENSEX 72800 PE\nBuy CMP\nSl 80")
 
     def test_above_and_near_need_a_price(self):
         for text in ("Buy above", "Buy near", "BUY ABOVE", "Buy 100"):

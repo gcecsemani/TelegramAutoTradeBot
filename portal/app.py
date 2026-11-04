@@ -471,7 +471,7 @@ def save_slippage(request: Request, symbol: str = Form("*"), slippage_mode: str 
     if user.get("role") != "admin":
         return _redirect("/dashboard", "Only the admin sets lot size and slippage")
     error = _check_csrf(request, csrf)
-    key = symbol.strip().upper() or "*"
+    key = store.canonical_symbol(symbol)
     try:
         slip = float(str(slippage_value).replace(",", "").strip())
     except ValueError:

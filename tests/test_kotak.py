@@ -12,8 +12,8 @@ import pytz                                           # noqa: E402
 
 from brokers.base import BrokerError, OrderRequest    # noqa: E402
 from brokers.kotak import (  # noqa: E402
-    KotakBroker, parse_kite_symbol, resolve_trading_symbol, scrip_board_lot, scrip_file_url,
-    sell_stop_limit,
+    KotakBroker, match_long, net_quantity, parse_kite_symbol, product_code,
+    resolve_trading_symbol, scrip_board_lot, scrip_file_url, sell_stop_limit,
 )
 
 
@@ -151,6 +151,7 @@ class OrderTests(unittest.TestCase):
         self.assertEqual(sent["pr"], "102.50")
         self.assertEqual(sent["ig"], "c" + "a" * 19)
         self.assertEqual(sent["pf"], "N")
+        self.assertEqual(sent["pc"], "MIS")
         headers = http.calls[0][2]
         self.assertEqual(headers.get("neo-fin-key"), "neotradeapi")
         self.assertEqual(headers.get("Auth"), "trade")
@@ -225,6 +226,113 @@ class OrderTests(unittest.TestCase):
         self.assertEqual(sent["tp"], "400.00")
         self.assertEqual(sent["pr"], "380.00")
         self.assertEqual(sent["qt"], "20")
+
+    def test_bse_stops_are_stop_limits(self):
+        working = _Response(200, {"data": {"nOrdNo": "9004", "ordSt": "trigger pending"}})
+        broker, http = self._broker([
+            ("/positions", _Response(200, {"data": [{
+                "trdSym": "SENSEX05NOV2676700CE", "prod": "MIS",
+                "flBuyQty": "20", "flSellQty": "0",
+            }]})),
+            ("/place", _Response(200, {"stat": "Ok", "nOrdNo": "9004"})),
+            ("/user/orders", working),
+        ], symbols=lambda exchange, symbol: "SENSEX05NOV2676700CE")
+        view = broker.place(_order(
+            exchange="BFO", tradingsymbol="SENSEX26N0576700CE", side="SELL", order_type="SL-M",
+            price=0, quantity=20, trigger_price=80, validity="DAY", tag="tag",
+        ))
+        self.assertEqual(view.status, "OPEN")
+        sent = json.loads(http.calls[1][4]["jData"])
+        self.assertEqual(sent["es"], "bse_fo")
+        self.assertEqual(sent["pt"], "SL")
+        self.assertEqual(sent["tp"], "80.00")
+        self.assertEqual(sent["pr"], "76.00")
+        self.assertEqual(sent["tt"], "S")
+        self.assertEqual(sent["qt"], "20")
+        self.assertEqual(sent["pc"], "MIS")
+
+    def test_a_bse_stop_move_stays_a_limit_stop(self):
+        book = _Response(200, {"data": [{
+            "nOrdNo": "9004", "ordSt": "trigger pending", "exSeg": "bse_fo", "prcTp": "SL",
+        }]})
+        broker, http = self._broker([
+            ("/user/orders", book),
+            ("/modify", _Response(200, {"stat": "Ok", "nOrdNo": "9004"})),
+        ])
+        broker.modify("9004", 80, 20)
+        sent = json.loads(http.calls[1][4]["jData"])
+        self.assertEqual(sent["pt"], "SL")
+        self.assertEqual(sent["tp"], "80.00")
+        self.assertEqual(sent["pr"], "76.00")
+
+    def test_stock_options_are_sent_as_normal_not_intraday(self):
+        self.assertEqual(product_code("NFO", "RELIANCE26NOV2500CE", "MIS"), "NRML")
+        self.assertEqual(product_code("NFO", "BAJAJ-AUTO26NOV10000PE", "MIS"), "NRML")
+        self.assertEqual(product_code("NFO", "NIFTY26N0322800PE", "MIS"), "MIS")
+        self.assertEqual(product_code("NFO", "BANKNIFTY26NOV54000CE", "MIS"), "MIS")
+        self.assertEqual(product_code("BFO", "SENSEX26N0576700CE", "MIS"), "MIS")
+        filled = _Response(200, {"data": [{
+            "nOrdNo": "9005", "ordSt": "complete", "avgPrc": "12", "fldQty": 500,
+        }]})
+        broker, http = self._broker([
+            ("/place", _Response(200, {"stat": "Ok", "nOrdNo": "9005"})),
+            ("/user/orders", filled),
+        ], symbols=lambda exchange, symbol: "RELIANCE26NOV252500CE")
+        broker.place(_order(tradingsymbol="RELIANCE26NOV2500CE", quantity=500, product="MIS"))
+        sent = json.loads(http.calls[0][4]["jData"])
+        self.assertEqual(sent["pc"], "NRML")
+        self.assertEqual(sent["es"], "nse_fo")
+
+    def test_a_sell_uses_the_open_long_and_does_not_exceed_it(self):
+        self.assertEqual(net_quantity({
+            "flBuyQty": "20", "flSellQty": "0", "cfBuyQty": "0", "cfSellQty": "0",
+        }), 20)
+        self.assertEqual(match_long([
+            {"trdSym": "SENSEX05NOV2676700CE", "prod": "NRML", "flBuyQty": "20", "flSellQty": "0"},
+            {"trdSym": "SENSEX05NOV2676700CE", "prod": "MIS", "flBuyQty": "0", "flSellQty": "0"},
+        ], "SENSEX05NOV2676700CE", "MIS"), ("NRML", 20))
+        filled = _Response(200, {"data": [{
+            "nOrdNo": "9006", "ordSt": "complete", "avgPrc": "40", "fldQty": 20,
+        }]})
+        broker, http = self._broker([
+            ("/positions", _Response(200, {"data": [{
+                "trdSym": "SENSEX05NOV2676700CE", "prod": "NRML",
+                "flBuyQty": "20", "flSellQty": "0", "cfBuyQty": "0", "cfSellQty": "0",
+            }]})),
+            ("/place", _Response(200, {"stat": "Ok", "nOrdNo": "9006"})),
+            ("/user/orders", filled),
+        ], symbols=lambda exchange, symbol: "SENSEX05NOV2676700CE")
+        view = broker.place(_order(
+            exchange="BFO", tradingsymbol="SENSEX26N0576700CE", side="SELL",
+            order_type="MARKET", price=0, quantity=40, product="MIS", validity="DAY",
+        ))
+        self.assertEqual(view.status, "COMPLETE")
+        sent = json.loads(http.calls[1][4]["jData"])
+        self.assertEqual(sent["pc"], "NRML")
+        self.assertEqual(sent["qt"], "20")
+        self.assertEqual(sent["pt"], "MKT")
+        self.assertEqual(sent["tt"], "S")
+
+    def test_a_sell_with_no_long_is_not_sent(self):
+        broker, http = self._broker([
+            ("/positions", _Response(200, {"data": []})),
+        ], symbols=lambda exchange, symbol: "SENSEX05NOV2676700CE")
+        with self.assertRaises(BrokerError) as caught:
+            broker.place(_order(
+                exchange="BFO", tradingsymbol="SENSEX26N0576700CE", side="SELL",
+                order_type="MARKET", price=0, quantity=20, product="MIS", validity="DAY",
+            ))
+        self.assertIn("not sent", str(caught.exception))
+        self.assertFalse(any("/place" in call[1] for call in http.calls))
+        broker, http = self._broker([
+            ("/positions", _Response(200, {"data": []})),
+        ], symbols=lambda exchange, symbol: "SENSEX05NOV2676700CE")
+        with self.assertRaises(BrokerError):
+            broker.place(_order(
+                exchange="BFO", tradingsymbol="SENSEX26N0576700CE", side="SELL",
+                order_type="SL-M", price=0, quantity=20, trigger_price=80, tag="tag",
+            ))
+        self.assertFalse(any("/place" in call[1] for call in http.calls))
 
     def test_an_nfo_stop_stays_a_stop_market(self):
         working = _Response(200, {"data": {"nOrdNo": "9003", "ordSt": "trigger pending"}})

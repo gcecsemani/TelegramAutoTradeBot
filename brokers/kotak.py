@@ -169,8 +169,12 @@ class KotakBroker:
         validity = "DAY" if segment == "mcx_fo" else order.validity
         price = "0" if order_type in ("MKT", "SL-M") else _px(order.price)
         trigger = _px(order.trigger_price) if order_type == "SL-M" else "0"
-        if segment == "mcx_fo" and order.order_type == "SL-M":
-            # MCX options reject a stop-market. A sell stop-limit sits under the trigger.
+        product = product_code(order.exchange, order.tradingsymbol, order.product)
+        quantity = int(order.quantity)
+        if order.side == "SELL":
+            product, quantity = self._close_buy(symbol, product, quantity)
+        if _stop_limit_segment(segment) and order.order_type == "SL-M":
+            # MCX and BSE FO reject a stop-market. A sell stop-limit sits under the trigger.
             order_type = "SL"
             price = _px(sell_stop_limit(order.trigger_price))
             trigger = _px(order.trigger_price)
@@ -179,11 +183,11 @@ class KotakBroker:
             "dq": "0",
             "es": segment,
             "mp": "0",
-            "pc": "MIS" if order.product == "MIS" else "NRML",
+            "pc": product,
             "pf": "N",
             "pr": price,
             "pt": order_type,
-            "qt": str(int(order.quantity)),
+            "qt": str(int(quantity)),
             "rt": "IOC" if validity == "IOC" else "DAY",
             "tp": trigger,
             "ts": symbol,
@@ -207,7 +211,7 @@ class KotakBroker:
         self._require_session()
         price_type = "SL-M"
         price = "0"
-        if _mcx_order(self._book_row(order_id, order_sent=False)):
+        if _stop_limit_order(self._book_row(order_id, order_sent=False)):
             price_type = "SL"
             price = _px(sell_stop_limit(trigger_price))
         body = {
@@ -277,6 +281,34 @@ class KotakBroker:
             return None
         matches.sort(key=lambda row: int(float(row.get("fldQty") or 0)), reverse=True)
         return _view(matches[0])
+
+    def _position_rows(self) -> list:
+        payload = self._call(
+            "GET", self._url("quick/user/positions"), self._trade_headers(form=False),
+            order_sent=False,
+        )
+        return _rows(payload)
+
+    def _close_buy(self, symbol: str, product: str, quantity: int):
+        """Sell only quantity already bought. An exit and a stop both follow this."""
+        try:
+            rows = self._position_rows()
+        except TokenError:
+            raise
+        except BrokerError as exc:
+            raise BrokerError(
+                f"Kotak positions could not be read, so the sell was not sent. {exc}"
+            ) from exc
+        found = match_long(rows, symbol, product)
+        if found is None:
+            raise BrokerError(f"No bought {symbol} at Kotak, so the sell was not sent.")
+        held_product, held = found
+        if held_product in ("MIS", "NRML"):
+            product = held_product
+        quantity = min(int(quantity), int(held))
+        if quantity <= 0:
+            raise BrokerError(f"No bought {symbol} left at Kotak, so the sell was not sent.")
+        return product, quantity
 
     def _trading_symbol(self, order: OrderRequest) -> str:
         if self._symbols is not None:
@@ -571,8 +603,71 @@ def _segment(exchange: str) -> str:
     return segment
 
 
+_INDEX_OPTIONS = {
+    "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50", "SENSEX", "BANKEX",
+}
+
+
+def product_code(exchange: str, tradingsymbol: str, product: str) -> str:
+    """Account product, except stock options. Kotak blocks MIS on those."""
+    code = "MIS" if (product or "").upper() == "MIS" else "NRML"
+    if code != "MIS" or (exchange or "").upper() != "NFO":
+        return code
+    parsed = parse_kite_symbol(tradingsymbol)
+    if parsed is not None:
+        return code if parsed[0] in _INDEX_OPTIONS else "NRML"
+    name = (tradingsymbol or "").upper()
+    if any(name.startswith(index) for index in sorted(_INDEX_OPTIONS, key=len, reverse=True)):
+        return code
+    return "NRML" if name else code
+
+
+def net_quantity(row: dict) -> int:
+    """Long quantity still open. Buys add, sells subtract, carried and today."""
+    if not isinstance(row, dict):
+        return 0
+    if any(key in row for key in ("flBuyQty", "cfBuyQty", "flSellQty", "cfSellQty")):
+        buy = _whole(row.get("flBuyQty")) + _whole(row.get("cfBuyQty"))
+        sell = _whole(row.get("flSellQty")) + _whole(row.get("cfSellQty"))
+        return buy - sell
+    for key in ("netQty", "netqty", "qty"):
+        if row.get(key) not in (None, ""):
+            return _whole(row.get(key))
+    return 0
+
+
+def match_long(rows: list, symbol: str, prefer: str):
+    """(product, quantity) already bought, or None when a sell would not be a close."""
+    wanted = (symbol or "").upper()
+    found = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        traded = str(row.get("trdSym") or row.get("trdSymbol") or row.get("tradingSymbol") or row.get("ts") or "")
+        if traded.upper() != wanted:
+            continue
+        qty = net_quantity(row)
+        if qty > 0:
+            found.append((str(row.get("prod") or row.get("pc") or row.get("product") or "").upper(), qty))
+    if not found:
+        return None
+    for item in found:
+        if item[0] == (prefer or "").upper():
+            return item
+    return found[0]
+
+
+def _whole(value) -> int:
+    if value in (None, ""):
+        return 0
+    try:
+        return int(float(str(value).replace(",", "").strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
 def sell_stop_limit(trigger: float, buffer: float = 0.05) -> float:
-    """Limit under a sell trigger. Kotak MCX options refuse a stop-market."""
+    """Limit under a sell trigger. Kotak MCX and BSE FO options refuse a stop-market."""
     trigger = round(float(trigger or 0), 2)
     if trigger <= 0:
         return 0.0
@@ -585,11 +680,15 @@ def sell_stop_limit(trigger: float, buffer: float = 0.05) -> float:
     return price
 
 
-def _mcx_order(row) -> bool:
+def _stop_limit_segment(segment: str) -> bool:
+    return segment in ("mcx_fo", "bse_fo")
+
+
+def _stop_limit_order(row) -> bool:
     if not isinstance(row, dict):
         return False
     segment = str(row.get("exSeg") or row.get("es") or row.get("exc") or "").lower()
-    return "mcx" in segment
+    return "mcx" in segment or "bse_fo" in segment or segment == "bfo"
 
 
 def _order_type(kind: str) -> str:

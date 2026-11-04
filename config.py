@@ -8,12 +8,11 @@ You post a call in the signal group:
     NIFTY 22800PE
     Buy Above 100        (or  Buy Near 90  /  Buy CMP)
     Sl 80                (optional)
-    Tgt 120 140 160++    (optional)
 
-and the bot takes a 2-lot paper trade on the nearest expiry at the live Kite
+and the bot takes a 1-lot paper trade on the nearest expiry at the live Kite
 quote. Tag a line that only names the option (Sensex 72800 PE) with
 Buy Above 120 / Buy Near 110 / Buy CMP to take that one. Tag the call with a
-follow-up (Exit, Book half, SL to cost, Tgt 110 …) to manage it.
+follow-up (Exit, Book half, SL 70 …) to manage it.
 "Exit all" closes everything.
 
 Everything is paper. No order is ever sent to the exchange.
@@ -123,8 +122,9 @@ HOLIDAYS: list = []      # "YYYY-MM-DD" — entries are refused on these days
 # ══════════════════════════════════════════════════════════════════════════════
 TRADE: dict = {
     # Lots on the signal book, on the nearest expiry. "Book half" sells half
-    # of these. Linked accounts are sized from their own cash in the portal.
-    "lots":                    2,
+    # of these, and the one lot when that is all that is open. Linked accounts
+    # are sized from their own cash in the portal.
+    "lots":                    1,
 
     # "Buy Above X": buys once the premium is at or above X, and no more
     # than this % above it. Higher than that, it waits.
@@ -134,7 +134,7 @@ TRADE: dict = {
     "near_band_pct":           2.5,
 
     # A call without an SL gets this one, from the fill, until you send yours.
-    # "No sl" / "Hero zero" removes it.
+    # "SL 0" removes it.
     "default_sl_pct":          30.0,
 
     # A new call older than this (bot was offline) is not taken.

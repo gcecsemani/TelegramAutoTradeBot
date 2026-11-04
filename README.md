@@ -1,8 +1,8 @@
 # Telegram signal → paper trading bot
 
-You post an option-buy call in the **signal group**. The bot takes a **2-lot paper trade on the nearest expiry** at the live Kite quote. You tag the call to manage it. No order is ever sent to the exchange.
+You post an option-buy call in the **signal group**. The bot takes a **1-lot paper trade on the nearest expiry** at the live Kite quote. You tag the call to manage it. No order is ever sent to the exchange.
 
-The bot never posts in the signal group. Every message from it (bought, waiting, SL moved, booked, exited, refused, errors) goes to the **update group**:
+The bot never posts in the signal group when that group is separate. Every message from it (bought, waiting, SL moved, booked, exited, refused, errors) goes to the **update group**. Each of those is one short line, so a shared group stays easy to scan and tag.
 
 ```
 TELEGRAM_SIGNAL_CHAT_ID=   # calls and follow-ups are read here
@@ -17,10 +17,9 @@ Only the messages below are acted on. **Everything else is ignored.**
 NIFTY 22800PE          NIFTY 22800PE          NIFTY 22800PE
 Buy Above 100          Buy Near 90            Buy CMP
 Sl 80                  Sl 70                  Sl 70
-Tgt 120 140 160++      Tgt 110 130 150++      Tgt 110 130 150++
 ```
 
-`Sl` and `Tgt` lines are optional.
+`Sl` is optional. A target line is ignored.
 
 ## Tag a watchlist line to buy it
 
@@ -36,16 +35,16 @@ Buy Above 120
 Buy Near 110
 ```
 
-`Buy Above` and `Buy Near` need a price. `Sl` and `Tgt` can go on the same reply. After it is taken, tag that same message to manage it (Exit, SL, targets, Buy again). A second buy on it is refused while that trade is still open or waiting.
+`Buy Above` and `Buy Near` need a price. `Sl` can go on the same reply. After it is taken, tag that same message to manage it (Exit, SL, Buy again). A second buy is refused while that trade is still open. While it is waiting, `Buy Near`, `Buy only`, `Buy Above` or `Buy CMP` replaces the entry.
 
 | Entry | Buys when |
 |---|---|
 | `Buy Above 100` | the premium is at or above 100 **and** no more than 2.5% above it (≤ 102.50). If it has already run further, the bot waits for it to come back into 100–102.50 |
 | `Buy Near 90` | the price is anything up to 2.5% above 90 (≤ 92.25). Any lower price is fine |
-| `Buy only 100` · `Buy.100` · `Buy. 100` | only when the ask is exactly 100 |
+| `Buy only 100` | only when the ask is exactly 100 |
 | `Buy CMP` | straight away, at the current price |
 
-- **Lots:** the signal book takes 2 lots (`TRADE["lots"]` in `config.py`), so "book half" is half of that book. Each linked account is sized from its own cash on the portal Config page.
+- **Lots:** the signal book takes 1 lot (`TRADE["lots"]` in `config.py`). "Book half" closes that lot. Each linked account is sized from its own cash on the portal Config page.
 - **Waiting calls:** a call still waiting is dropped at that day's square-off.
 - **No SL in the call:** the bot sets one 30% below the fill until you send yours.
 - **SL already broken:** if the price is already at or below your SL when it would buy, the call is refused (or dropped, if it was waiting).
@@ -56,13 +55,11 @@ Works the same for SENSEX, CRUDEOIL, NATURALGAS, GOLD(M), SILVER(M), BANKNIFTY a
 
 | Tag with | Does |
 |---|---|
-| `SL 70` | SL to 70 |
-| `SL to cost` · `SL at cost` · `SL at CTC` · `SL CTC` | SL to your entry price |
-| `No sl` · `Hero zero` · `Hero to Zero` | no SL |
-| `Exit` · `Book` · `Book full` · `Book fully` · `Ignore` · `Avoid` · `Cancel` · `Close` · `Sell` · `SL hit` | sells **both lots** now, in profit or loss. A call still waiting is dropped |
-| `Book half` · `Book 50` · `Book 50%` | sells **1 of the 2 lots** now. On the last lot it sells that one |
-| `Tgt 110` · `Tgt 110 120 130` · `Target 110` · `Target 110 120 130` | replaces the targets |
-| `Buy again` · `Buy again Above 100` · `Buy again Near 100` · `Buy again CMP` | posts the same call again — same strike, same SL and targets, 2 new lots. Plain `Buy again` keeps the original entry; the other three use that entry instead. Only once the previous trade on it is closed (or dropped); after that, tags on the original call act on the new trade |
+| `Buy Near 100` · `Buy only 100` · `Buy Above 100` · `Buy CMP`, while the call is waiting | replaces the entry. Buys now if the live price already fits; otherwise it keeps waiting on the new rule. An SL on that same tag replaces the waiting SL |
+| `SL 70` | SL to 70. `SL 0` removes the stop |
+| `Exit` · `Book` · `Book full` · `Book fully` · `Cancel` | sells the open lot now, in profit or loss. A call still waiting is dropped |
+| `Book half` · `Book 50` | sells half the open lots. On a 1-lot book it sells that lot |
+| `Buy again` · `Buy again Above 100` · `Buy again Near 100` · `Buy again CMP` | posts the same call again — same strike, same SL, 1 new lot. Plain `Buy again` keeps the original entry; the other three use that entry instead. Only once the previous trade on it is closed (or dropped); after that, tags on the original call act on the new trade |
 
 An SL must be below the live premium, otherwise it is refused and the old SL stays.
 
@@ -109,7 +106,7 @@ Lot size is the account's cash divided by the rupees configured for that symbol,
 
 | Control | Where |
 |---|---|
-| Rupees per lot, slippage | admin Config page, shared by every account. `*` is every symbol without its own row. Slippage is percent or points |
+| Rupees per lot, slippage | admin Config page, shared by every account. `*` is every symbol without its own row. A short name such as `CRUDE` is the same row as `CRUDEOIL`. Slippage is percent or points, added to the copy buy limit. `Buy only` uses the price with no slippage |
 | Paper balance | on the account, used only while that account is on paper. Live reads the broker's cash |
 | Max loss per trade | cuts the lot count. Below 1 lot, the buy is skipped |
 | Max loss per day | same, and the auto kill switch can stop the account |
@@ -120,7 +117,7 @@ Lot size is the account's cash divided by the rupees configured for that symbol,
 
 Kotak Neo uses the Trade API token as the API key, the MPIN as the secret, the UCC as the client id, and the registered mobile number. A Zerodha contract name is translated to Kotak's name before the order is sent. Dhan and Groww can be saved; they do not place orders yet.
 
-On the droplet, `deploy/telegram-bot.service` and `deploy/portal.service` run the two processes. To stop the signal bot outside market hours, disable that service and enable `deploy/market-hours.timer` instead. It starts the bot at 08:45 IST on trading days and stops it at 00:10, after the MCX close. Weekends and dates in `HOLIDAYS` stay stopped. The portal keeps running so the morning quote login still works. Leave `PORTAL_HOST=127.0.0.1` and open it with `ssh -L 8080:127.0.0.1:8080 bot@YOUR_DROPLET`. The first registered user is the admin. Set `PORTAL_INVITE_CODE` before anyone else can register.
+On the droplet, `deploy/telegram-bot.service` and `deploy/portal.service` run the two processes. To stop the signal bot outside market hours, disable that service and enable `deploy/market-hours.timer` instead. It starts the bot at 08:00 IST on trading days and stops it at 00:10, after the MCX close. Weekends and dates in `HOLIDAYS` stay stopped. The portal keeps running so the morning quote login still works. Leave `PORTAL_HOST=127.0.0.1` and open it with `ssh -L 8080:127.0.0.1:8080 bot@YOUR_DROPLET`. The first registered user is the admin. Set `PORTAL_INVITE_CODE` before anyone else can register.
 
 `python3 main.py --parse "your message"` shows how a message is read (add `--reply` for a follow-up, and `--tagged "Sensex 72800 PE"` for a buy on a watchlist line).
 

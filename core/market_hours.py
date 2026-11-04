@@ -3,7 +3,7 @@ core/market_hours.py
 ====================
 Decides whether the signal bot should be running.
 
-The window is weekday mornings from 08:45 IST through a few minutes after
+The window is weekday mornings from 08:00 IST through a few minutes after
 the MCX close (23:30 or 23:55). Saturday, Sunday, and configured holidays
 stay stopped. The portal is not part of this decision.
 """
@@ -18,7 +18,7 @@ from typing import Optional
 import config
 from core import clock
 
-_START = 8 * 60 + 45
+_START = 8 * 60
 _STOP = 10
 
 

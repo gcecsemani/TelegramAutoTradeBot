@@ -46,7 +46,7 @@ _STOP_RETRY_SEC = 15
 
 
 def _market_stop_blocked(text: str) -> bool:
-    """Kotak's MCX option block on a stop-market. One later try sends a stop-limit."""
+    """Kotak blocked a stop-market. One later try sends a stop-limit."""
     return "stop loss market order not allowed" in (text or "").lower()
 
 

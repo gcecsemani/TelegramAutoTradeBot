@@ -77,7 +77,7 @@ class FakeTelegram:
         self.next_id += 1
         self.sent.append({"id": self.next_id, "text": text, "reply_to": reply_to})
         if on_sent:
-            on_sent(f"{UPDATE}:{self.next_id}")
+            on_sent(f"{self.update_chat}:{self.next_id}")
 
     def send_document(self, filename, content, caption="", reply_to=None):
         self.next_id += 1
@@ -155,14 +155,14 @@ class Harness(unittest.TestCase):
 
 
 class EntryTests(Harness):
-    def test_buy_cmp_takes_two_lots_at_the_ask(self):
+    def test_buy_cmp_takes_one_lot_at_the_ask(self):
         self.gw.set(PE, 95.0, spread=1)
         self.post("NIFTY 22800PE\nBuy CMP\nSl 70\nTgt 110 130 150++")
         pos = self.only()
         self.assertEqual((pos.status, pos.entry_price, pos.lots, pos.multiplier, pos.sl, pos.targets),
-                         ("OPEN", 95.5, 2, 65, 70.0, [110.0, 130.0, 150.0]))
+                         ("OPEN", 95.5, 1, 65, 70.0, []))
         self.assertIn("BOUGHT NIFTY 22800 PE", self.tg.last())
-        self.assertIn("2 lots (130 qty)", self.tg.last())
+        self.assertIn("1 lot (65 qty)", self.tg.last())
 
     def test_buy_above_waits_for_the_cross(self):
         self.gw.set(PE, 96.0)
@@ -234,7 +234,7 @@ class EntryTests(Harness):
         self.gw.set("NFO:BAJAJ-AUTO26OCT10000PE", 104.0)
         self.post("Bajaj auto 10000 PE\nBuy Near 105\nSl 70")
         qty = sorted((p.symbol, p.lots * p.multiplier) for p in self.trader.positions.values())
-        self.assertEqual(qty, [("BAJAJ-AUTO", 150), ("CRUDEOIL", 200)])
+        self.assertEqual(qty, [("BAJAJ-AUTO", 75), ("CRUDEOIL", 100)])
 
     def test_closed_market_unlisted_stale_and_broken(self):
         self.set_time(8, 0)
@@ -244,7 +244,7 @@ class EntryTests(Harness):
         self.post("NIFTY 22825PE\nBuy CMP")
         self.assertIn("not listed", self.tg.last())
         self.post("NIFTY 22800PE\nBuy 100")
-        self.assertIn("Buy Above 100, Buy Near 90, Buy Near 100-105, Buy only 100, Buy.100 or Buy CMP", self.tg.last())
+        self.assertIn("Buy Above 100, Buy Near 90, Buy Near 100-105, Buy only 100 or Buy CMP", self.tg.last())
         self.msg_id += 1
         self.bot.handle_update({"update_id": 1, "message": {
             "message_id": self.msg_id, "date": clock.now().timestamp() - 900, "chat": {"id": int(SIGNAL)},
@@ -264,47 +264,39 @@ class FollowUpTests(Harness):
         call = self.post(text)
         return call, self.only()
 
-    def test_book_half_then_exit(self):
+    def test_book_half_closes_the_one_lot(self):
         call, pos = self.open_trade()
         self.gw.set(PE, 112.0)
         self.post("Book half", reply_to=call)
-        self.assertEqual((pos.status, pos.lots), ("OPEN", 1))
-        self.assertIn("BOOKED 1 OF 2 LOTS", self.tg.last())
-        self.gw.set(PE, 120.0)
-        self.post("Exit", reply_to=call)
-        self.assertEqual(pos.status, "CLOSED")
-        self.assertEqual(pos.gross, (12 + 20) * 65)
-        self.assertIn("+₹2,020", self.tg.last())                 # 2080 − 3 orders × ₹20
+        self.assertEqual((pos.status, pos.lots), ("CLOSED", 0))
+        self.assertIn("Only 1 lot was open", self.tg.last())
+        self.assertEqual(pos.gross, 12 * 65)
+        self.assertIn("+₹740", self.tg.last())                 # 780 − 2 orders × ₹20
         with open(config.PATHS["trade_journal"]) as fh:
             row = list(csv.DictReader(fh))[0]
         self.assertEqual((row["lots"], row["exit_price"], row["exit_reason"]),
-                         ("2", "116.0", "BOOK HALF + EXIT (your reply)"))
+                         ("1", "112.0", "BOOK HALF"))
 
-    def test_book_50_forms_and_last_lot(self):
-        for text in ("Book 50", "Book 50%"):
-            self.trader.positions.clear()
-            call, pos = self.open_trade()
-            self.post(text, reply_to=call)
-            self.assertEqual(pos.lots, 1, text)
-            self.post("Book half", reply_to=call)
-            self.assertEqual(pos.status, "CLOSED", text)
-            self.assertIn("Only 1 lot was open", self.tg.last())
+    def test_book_50_closes_the_one_lot(self):
+        call, pos = self.open_trade()
+        self.post("Book 50", reply_to=call)
+        self.assertEqual(pos.status, "CLOSED")
+        self.assertIn("Only 1 lot was open", self.tg.last())
 
-    def test_every_exit_word_exits_both_lots_in_profit_or_loss(self):
-        for word, ltp in (("Exit", 60.0), ("Book", 130.0), ("Ignore", 99.0), ("Avoid", 101.0), ("Cancel", 90.0),
-                          ("Close", 85.0), ("Sell", 140.0), ("SL hit", 81.0), ("Book full", 120.0),
-                          ("Book fully", 120.0)):
+    def test_every_exit_word_exits_the_lot_in_profit_or_loss(self):
+        for word, ltp in (("Exit", 60.0), ("Book", 130.0), ("Cancel", 90.0),
+                          ("Book full", 120.0), ("Book fully", 120.0)):
             self.trader.positions.clear()
             call, pos = self.open_trade()
             self.gw.set(PE, ltp)
             self.post(word, reply_to=call)
             self.assertEqual((pos.status, pos.lots, pos.exits[-1]["lots"], pos.avg_exit),
-                             ("CLOSED", 0, 2, ltp), word)
+                             ("CLOSED", 0, 1, ltp), word)
 
     def test_exit_on_a_waiting_call_drops_it(self):
         self.gw.set(PE, 110.0)
         call = self.post("NIFTY 22800PE\nBuy Near 90")
-        self.post("Avoid", reply_to=call)
+        self.post("Cancel", reply_to=call)
         self.assertEqual(self.only().status, "CANCELLED")
         self.price(85.0)
         self.assertEqual(self.only().status, "CANCELLED")
@@ -314,61 +306,104 @@ class FollowUpTests(Harness):
         self.gw.set(PE, 135.0)
         self.post("SL 90", reply_to=call)
         self.assertEqual(pos.sl, 90.0)
-        for text in ("SL to cost", "SL at cost", "SL at CTC", "SL CTC"):
-            pos.sl = 80.0
-            self.post(text, reply_to=call)
-            self.assertEqual(pos.sl, 100.0, text)
         self.post("SL 140", reply_to=call)                       # above the live 135
-        self.assertEqual(pos.sl, 100.0)
+        self.assertEqual(pos.sl, 90.0)
         self.assertIn("not below the live premium", self.tg.last())
         count = len(self.tg.sent)
-        self.post("SL to t1", reply_to=call)
-        self.assertEqual((pos.sl, len(self.tg.sent)), (100.0, count))
-        for text in ("No sl", "Hero zero", "Hero to Zero"):
-            pos.sl, pos.no_sl = 90.0, False
+        for text in ("SL to t1", "SL to cost", "SL at cost", "SL at CTC", "No sl", "Hero zero", "Hero to Zero"):
             self.post(text, reply_to=call)
-            self.assertEqual((pos.sl, pos.no_sl), (None, True), text)
+            self.assertEqual((pos.sl, pos.no_sl, len(self.tg.sent)), (90.0, False, count), text)
         self.price(10.0)
-        self.assertEqual(pos.status, "OPEN")                      # no SL, nothing fires
+        self.assertEqual(pos.status, "CLOSED")                    # the SL at 90 is still there
 
     def test_targets_and_hold_ignored(self):
         call, pos = self.open_trade("NIFTY 22800PE\nBuy CMP\nSl 80")
-        self.post("Tgt 110", reply_to=call)
-        self.assertEqual(pos.targets, [110.0])
-        self.post("Target 110 120 130", reply_to=call)
-        self.assertEqual(pos.targets, [110.0, 120.0, 130.0])
         count = len(self.tg.sent)
-        self.post("Hold", reply_to=call)
-        self.assertEqual((len(self.tg.sent), pos.status, pos.sl), (count, "OPEN", 80.0))
+        for text in ("Tgt 110", "Tgt 110 120 130", "Target 110", "Target 110 120 130", "Hold",
+                     "Buy.100", "Ignore", "Avoid", "Close", "Sell", "SL hit", "Book 50%"):
+            self.post(text, reply_to=call)
+        self.assertEqual((len(self.tg.sent), pos.status, pos.sl, pos.targets, pos.lots),
+                         (count, "OPEN", 80.0, [], 1))
 
     def test_waiting_call_follow_ups(self):
         self.gw.set(PE, 110.0)
         call = self.post("NIFTY 22800PE\nBuy Near 90")
         pos = self.only()
         self.post("SL 70", reply_to=call)
+        count = len(self.tg.sent)
         self.post("Tgt 120 140", reply_to=call)
         self.post("SL to cost", reply_to=call)
-        self.assertIn("not bought yet", self.tg.last())
+        self.assertEqual(len(self.tg.sent), count)
         self.price(91.0)
-        self.assertEqual((pos.status, pos.sl, pos.targets), ("OPEN", 70.0, [120.0, 140.0]))
+        self.assertEqual((pos.status, pos.sl, pos.targets), ("OPEN", 70.0, []))
 
-    def test_sl_hit_closes_both_lots(self):
+    def test_a_waiting_call_takes_a_new_entry(self):
+        self.gw.set(PE, 96.0)
+        text = "NIFTY 22800PE\nBuy Above 120\nSl 80"
+        call = self.post(text)
+        pos = self.only()
+        self.assertEqual(pos.status, "PENDING")
+        self.post("Buy near 100", reply_to=call, reply_text=text)
+        self.assertEqual((pos.status, pos.mode, pos.level, pos.entry_price, pos.sl),
+                         ("OPEN", "NEAR", 100.0, 96.0, 80.0))
+        self.assertIn("BOUGHT", self.tg.last())
+        self.assertEqual(len(self.trader.positions), 1)
+
+        self.trader.positions.clear()
+        self.gw.set(PE, 110.0)
+        text = "NIFTY 22800PE\nBuy Above 100\nSl 80"
+        call = self.post(text)
+        pos = self.only()
+        reply = self.post("buy only 100", reply_to=call, reply_text=text)
+        self.assertEqual((pos.status, pos.mode, pos.level, pos.sl), ("PENDING", "ONLY", 100.0, 80.0))
+        self.assertIn("exactly 100", self.tg.last())
+        self.assertEqual(self.tg.sent[-1]["reply_to"], self.sref(reply))
+        self.price(100.0)
+        self.assertEqual((pos.status, pos.entry_price), ("OPEN", 100.0))
+
+        self.trader.positions.clear()
+        self.gw.set(PE, 110.0)
+        text = "NIFTY 22800PE\nBuy Above 100\nSl 80"
+        call = self.post(text)
+        self.post("Buy near 90\nSl 70", reply_to=call, reply_text=text)
+        pos = self.only()
+        self.assertEqual((pos.status, pos.mode, pos.level, pos.sl), ("PENDING", "NEAR", 90.0, 70.0))
+        self.assertIn("at or under 92.25", self.tg.last())
+        self.price(92.0)
+        self.assertEqual((pos.status, pos.entry_price, pos.sl), ("OPEN", 92.0, 70.0))
+
+    def test_a_waiting_entry_can_be_changed_from_the_bot_message(self):
+        self.gw.set(PE, 96.0)
+        self.post("NIFTY 22800PE\nBuy Above 120\nSl 70")
+        self.post("Buy only 96", reply_to=self.tg.sent[-1]["id"], chat=UPDATE,
+                  reply_text="WAITING · NIFTY 22800 PE · Buy Above 120")
+        pos = self.only()
+        self.assertEqual((pos.status, pos.mode, pos.entry_price, pos.sl), ("OPEN", "ONLY", 96.0, 70.0))
+
+    def test_a_different_option_does_not_change_the_waiting_call(self):
+        self.gw.set(PE, 96.0)
+        text = "NIFTY 22800PE\nBuy Above 120"
+        call = self.post(text)
+        pos = self.only()
+        self.post("Buy near 100", reply_to=call, reply_text="SENSEX 73000 PE")
+        self.assertIn("different option", self.tg.last())
+        self.assertEqual((pos.status, pos.mode, pos.level), ("PENDING", "ABOVE", 120.0))
+        self.assertEqual(len(self.trader.positions), 1)
+
+    def test_sl_hit_closes_the_lot(self):
         call, pos = self.open_trade()
         self.price(79.5)
-        self.assertEqual((pos.status, pos.close_reason, pos.exits[0]["lots"]), ("CLOSED", "SL HIT", 2))
+        self.assertEqual((pos.status, pos.close_reason, pos.exits[0]["lots"]), ("CLOSED", "SL HIT", 1))
         self.post("Exit", reply_to=call)
         self.assertIn("already closed", self.tg.last())
 
-    def test_targets_only_alert(self):
+    def test_a_target_price_does_not_act(self):
         call, pos = self.open_trade()
-        self.price(111.0)
-        self.assertIn("Target 1 110 reached", self.tg.last())
-        self.price(131.0)
-        self.assertIn("Target 2 130 reached", self.tg.last())
-        self.assertEqual((pos.status, pos.sl, pos.lots), ("OPEN", 80.0, 2))
         count = len(self.tg.sent)
-        self.price(132.0)
+        self.price(111.0)
+        self.price(131.0)
         self.assertEqual(len(self.tg.sent), count)
+        self.assertEqual((pos.status, pos.sl, pos.lots, pos.targets), ("OPEN", 80.0, 1, []))
 
     def test_square_off(self):
         call, pos = self.open_trade()
@@ -403,7 +438,7 @@ class FollowUpTests(Harness):
         pos = self.only()
         self.assertEqual((pos.status, pos.symbol, pos.strike, pos.opt_type, pos.mode, pos.entry_price,
                           pos.sl, pos.targets),
-                         ("OPEN", "SENSEX", 73000.0, "PE", "CMP", 250.0, 200.0, [300.0, 340.0]))
+                         ("OPEN", "SENSEX", 73000.0, "PE", "CMP", 250.0, 200.0, []))
         self.assertIn(self.sref(watch), pos.refs)
         self.assertIn(self.sref(reply), pos.refs)
         self.assertIn("BOUGHT", self.tg.last())
@@ -452,7 +487,8 @@ class FollowUpTests(Harness):
         self.assertEqual(fresh.load(), 1)
         self.bot.trader = fresh
         self.post("Book half", reply_to=call)
-        self.assertEqual(fresh.find_by_message(self.sref(call)).lots, 1)
+        kept = fresh.find_by_message(self.sref(call))
+        self.assertEqual((kept.status, kept.lots), ("CLOSED", 0))
 
     def test_edit_updates_sl_and_targets(self):
         call, pos = self.open_trade()
@@ -460,7 +496,7 @@ class FollowUpTests(Harness):
                "chat": {"id": int(SIGNAL)}, "from": {"id": 1},
                "text": "NIFTY 22800PE\nBuy CMP\nSl 85\nTgt 115 135"}
         self.bot.handle_update({"update_id": 999, "edited_message": msg})
-        self.assertEqual((pos.sl, pos.targets), (85.0, [115.0, 135.0]))
+        self.assertEqual((pos.sl, pos.targets), (85.0, []))
 
 
 class BuyAgainTests(Harness):
@@ -480,7 +516,7 @@ class BuyAgainTests(Harness):
         self.assertIsNot(second, first)
         self.assertEqual((second.tradingsymbol, second.mode, second.level, second.sl, second.targets,
                           second.status, second.lots),
-                         (first.tradingsymbol, "ABOVE", 100.0, 80.0, [120.0, 140.0], "PENDING", 2))
+                         (first.tradingsymbol, "ABOVE", 100.0, 80.0, [], "PENDING", 1))
         self.assertIn("WAITING", self.tg.last())
         self.price(100.5)
         self.assertEqual((second.status, second.entry_price), ("OPEN", 100.5))
@@ -490,9 +526,9 @@ class BuyAgainTests(Harness):
         self.post("Buy again", reply_to=call)
         self.price(101.0)
         self.post("Book half", reply_to=call)
-        second = self.trader.find_by_message(self.sref(call))
-        self.assertIsNot(second, first)
-        self.assertEqual((second.status, second.lots), ("OPEN", 1))
+        second = next(p for p in self.trader.positions.values() if p is not first)
+        self.assertIn(self.sref(call), second.refs)
+        self.assertEqual((second.status, second.close_reason), ("CLOSED", "BOOK HALF"))
 
     def test_buy_again_while_open_is_refused(self):
         self.gw.set(PE, 101.0)
@@ -525,7 +561,7 @@ class BuyAgainTests(Harness):
         second = self.trader.find_by_message(self.sref(call))
         self.assertIsNot(second, first)
         self.assertEqual((second.status, second.mode, second.level, second.sl, second.targets),
-                         ("PENDING", "ABOVE", 110.0, 80.0, [120.0, 140.0]))
+                         ("PENDING", "ABOVE", 110.0, 80.0, []))
         self.assertIn("Buy Above 110", second.signal_text)
         self.assertIn("WAITING", self.tg.last())
         self.price(110.5)
@@ -547,7 +583,7 @@ class BuyAgainTests(Harness):
         second = self.trader.find_by_message(self.sref(call))
         self.assertIsNot(second, first)
         self.assertEqual((second.status, second.mode, second.level, second.entry_price, second.sl, second.targets),
-                         ("OPEN", "CMP", None, 95.0, 80.0, [120.0, 140.0]))
+                         ("OPEN", "CMP", None, 95.0, 80.0, []))
         self.assertIn("Buy CMP", second.signal_text)
 
 
@@ -562,7 +598,7 @@ class CommandTests(Harness):
         report = self.tg.last()
         self.assertIn("OPEN POSITIONS (2)", report)
         self.assertIn("NIFTY 22800 PE", report)
-        self.assertIn("+₹1,300", report)                     # (110 − 100) × 130
+        self.assertIn("+₹650", report)                     # (110 − 100) × 65
         self.assertIn("waiting · Buy Near 200", report)
 
     def test_pnl(self):
@@ -572,9 +608,9 @@ class CommandTests(Harness):
         self.post("Book half", reply_to=call)
         self.post("/pnl", chat=UPDATE)
         report = self.tg.last()
-        self.assertIn("booked +₹610", report)                # 650 − 2 orders × ₹20
-        self.assertIn("open +₹650", report)
-        self.assertIn("Total +₹1,260", report)
+        self.assertIn("+₹610", report)                       # 650 − 2 orders × ₹20
+        self.assertIn("Open ₹0", report)
+        self.assertIn("Total +₹610", report)
 
     def test_trades_sends_the_csv(self):
         self.post("/trades", chat=UPDATE)
@@ -620,7 +656,7 @@ class TwoGroupTests(Harness):
         self.gw.set(PE, 100.0)
         self.post(self.CALL)
         self.post("Book half", reply_to=self.tg.sent[-1]["id"], chat=UPDATE)
-        self.assertEqual(self.only().lots, 1)
+        self.assertEqual((self.only().status, self.only().lots), ("CLOSED", 0))
 
     def test_same_message_number_in_both_groups_does_not_mix_trades(self):
         self.gw.set(PE, 100.0)

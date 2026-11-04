@@ -11,6 +11,7 @@ same action. state/portal.db is local runtime data and is not committed.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from typing import Iterator, List, Optional
@@ -188,6 +189,17 @@ def _all(conn: sqlite3.Connection, sql: str, args: tuple = ()) -> List[dict]:
 def _symbol_key(symbol: str) -> str:
     text = (symbol or "").strip().upper()
     return text or "*"
+
+
+def canonical_symbol(symbol: str) -> str:
+    """The name a trade uses. CRUDE and CRUDE OIL are CRUDEOIL; * stays *."""
+    key = _symbol_key(symbol)
+    if key == "*":
+        return "*"
+    for name, cfg in config.SYMBOLS.items():
+        if key == name or any(re.fullmatch(alias, key) for alias in cfg["aliases"]):
+            return name
+    return key
 
 
 def _seed_copy_rules(conn: sqlite3.Connection) -> None:
@@ -416,7 +428,7 @@ def upsert_slippage(symbol: str, mode: str, value: float) -> None:
                ON CONFLICT(symbol) DO UPDATE SET
                  slippage_mode = excluded.slippage_mode,
                  slippage_value = excluded.slippage_value""",
-            (_symbol_key(symbol), mode, float(value)),
+            (canonical_symbol(symbol), mode, float(value)),
         )
 
 
@@ -429,13 +441,13 @@ def delete_slippage(symbol: str) -> None:
 
 
 def effective_slippage(symbol: str) -> dict:
-    key = _symbol_key(symbol)
+    """The admin row for this symbol. A short name matches the trade name; * is the fallback."""
+    wanted = canonical_symbol(symbol)
     with connect() as conn:
-        row = None
-        if key != "*":
-            row = _one(conn, "SELECT * FROM slippage_rules WHERE symbol = ?", (key,))
-        if row is None:
-            row = _one(conn, "SELECT * FROM slippage_rules WHERE symbol = '*'", ())
+        rows = _all(conn, "SELECT * FROM slippage_rules")
+    named = [row for row in rows if row["symbol"] != "*" and canonical_symbol(row["symbol"]) == wanted]
+    named.sort(key=lambda row: row["symbol"] != wanted)
+    row = named[0] if named else next((row for row in rows if row["symbol"] == "*"), None)
     if row is None:
         return {"slippage_mode": "PERCENT", "slippage_value": 1.0}
     return {"slippage_mode": row["slippage_mode"], "slippage_value": float(row["slippage_value"])}
