@@ -2,14 +2,12 @@
 
 You post an option-buy call in the **signal group**. The bot takes a **2-lot paper trade on the nearest expiry** at the live Kite quote. You tag the call to manage it. No order is ever sent to the exchange.
 
-The bot never posts in the signal group. The signal book (bought, waiting, SL moved, booked, exited, refused) still posts in the **update group**. A linked account's own trade update goes to that account owner's Telegram chat instead:
+The bot never posts in the signal group. Every message from it (bought, waiting, SL moved, booked, exited, refused, errors) goes to the **update group**:
 
 ```
 TELEGRAM_SIGNAL_CHAT_ID=   # calls and follow-ups are read here
-TELEGRAM_UPDATE_CHAT_ID=   # the signal book posts here
+TELEGRAM_UPDATE_CHAT_ID=   # the bot posts here
 ```
-
-Message the bot in a private chat and it replies with your chat id. Paste that into **Telegram chat id** on the account. Every account that owner has uses the same chat. A blank id sends no trade update for that owner.
 
 Only the messages below are acted on. **Everything else is ignored.**
 
@@ -47,7 +45,7 @@ Buy Near 110
 | `Buy only 100` · `Buy.100` · `Buy. 100` | only when the ask is exactly 100 |
 | `Buy CMP` | straight away, at the current price |
 
-- **Lots:** the signal book takes 2 lots (`TRADE["lots"]` in `config.py`), so "book half" is half of that book. Each linked account takes the lot count for the balance range its cash falls in, set on the portal Config page.
+- **Lots:** the signal book takes 2 lots (`TRADE["lots"]` in `config.py`), so "book half" is half of that book. Each linked account is sized from its own cash on the portal Config page.
 - **Waiting calls:** a call still waiting is dropped at that day's square-off.
 - **No SL in the call:** the bot sets one 30% below the fill until you send yours.
 - **SL already broken:** if the price is already at or below your SL when it would buy, the call is refused (or dropped, if it was waiting).
@@ -107,14 +105,14 @@ A signal is decided once, from the live quote. That decision is then copied, in 
 
 Each copy writes an order intent before calling the broker. The intent key is unique, and a Zerodha order is tagged with it. If the process dies after the send, recovery looks the order up by that tag instead of sending it again. Buys are limit + IOC at the admin slippage cap. Exits are market orders. A kill switch stops new buys immediately; exits still go out.
 
-Lot size is the balance range the account's cash falls in. Both ends count. NIFTY, SENSEX and BANKNIFTY start at ₹35,000–₹50,000 for 1 lot, ₹50,001–₹100,000 for 2, then higher ranges up to ₹500,000 for 5. Every other symbol uses `*`, starting at ₹100,000–₹199,999 for 1 lot. Cash outside every range for that symbol takes no trade. An open position does not reduce the cash used for the next trade; the check only chooses the lot size. The broker can still reject an order if the exchange margin is not there.
+Lot size is the account's cash divided by the rupees configured for that symbol, rounded down. NIFTY, SENSEX and BANKNIFTY start at ₹50,000 for one lot. Every other symbol starts at ₹100,000. An open position does not reduce the cash used for the next trade; the check only chooses the lot size. The broker can still reject an order if the exchange margin is not there.
 
 | Control | Where |
 |---|---|
-| Balance ranges, slippage | admin Config page, shared by every account. `*` is every symbol without its own rows. Slippage is percent or points |
+| Rupees per lot, slippage | admin Config page, shared by every account. `*` is every symbol without its own row. Slippage is percent or points |
 | Paper balance | on the account, used only while that account is on paper. Live reads the broker's cash |
 | Max loss per trade | cuts the lot count. Below 1 lot, the buy is skipped |
-| Max loss per day | a percent of that account's cash. 10 on a ₹1,00,000 balance is ₹10,000. At that loss the kill switch turns on |
+| Max loss per day | same, and the auto kill switch can stop the account |
 | Kill switch / flatten | portal buttons. Flatten sells whatever that account still holds |
 | Quote login | admin, portal page **Quote login**, every morning. Renews the `.env` price token. The running bot reads it without a restart |
 | Daily login | each trading account, from the portal, every morning. Zerodha pastes the redirect URL. Kotak Neo enters the authenticator code |

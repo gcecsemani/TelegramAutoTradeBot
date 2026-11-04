@@ -73,11 +73,11 @@ class FakeTelegram:
         self.signal_chats = {SIGNAL}
         self.update_chat = UPDATE
 
-    def send(self, text, reply_to=None, on_sent=None, chat_id=None):
+    def send(self, text, reply_to=None, on_sent=None):
         self.next_id += 1
-        self.sent.append({"id": self.next_id, "text": text, "reply_to": reply_to, "chat_id": chat_id})
+        self.sent.append({"id": self.next_id, "text": text, "reply_to": reply_to})
         if on_sent:
-            on_sent(f"{chat_id or UPDATE}:{self.next_id}")
+            on_sent(f"{UPDATE}:{self.next_id}")
 
     def send_document(self, filename, content, caption="", reply_to=None):
         self.next_id += 1
@@ -155,17 +155,6 @@ class Harness(unittest.TestCase):
 
 
 class EntryTests(Harness):
-    def test_a_private_message_replies_with_the_chat_id(self):
-        self.bot.handle_update({"update_id": 1, "message": {
-            "message_id": 9,
-            "chat": {"id": 424242, "type": "private"},
-            "from": {"id": 424242, "is_bot": False, "first_name": "Ada"},
-            "text": "/start",
-            "date": int(clock.now().timestamp()),
-        }})
-        self.assertIn("424242", self.tg.last())
-        self.assertEqual(self.tg.sent[-1]["chat_id"], "424242")
-
     def test_buy_cmp_takes_two_lots_at_the_ask(self):
         self.gw.set(PE, 95.0, spread=1)
         self.post("NIFTY 22800PE\nBuy CMP\nSl 70\nTgt 110 130 150++")
@@ -599,9 +588,6 @@ class CommandTests(Harness):
         self.assertTrue(sent["file"].startswith("trades_") and sent["file"].endswith(".csv"))
         self.assertIn(b"NIFTY26OCT22800PE", sent["content"])
         self.assertIn("1 closed trades", sent["text"])
-        self.assertIn("1 lot", sent["text"])
-        self.assertIn("+₹650", sent["text"])                 # (110 − 100) × 65
-        self.assertNotIn(b"1260", sent["content"])
 
     def test_commands_only_in_the_update_group(self):
         for command in ("/op", "/pnl", "/trades"):

@@ -78,23 +78,15 @@
         <input id="max_loss_trade" name="max_loss_trade" inputmode="decimal" value="{{ account.max_loss_trade if account.max_loss_trade is not none else '' }}">
       </div>
       <div class="field">
-        <label for="max_loss_day_pct">Max loss per day (% of cash, blank = no cap)</label>
-        <input id="max_loss_day_pct" name="max_loss_day_pct" inputmode="decimal" placeholder="10" value="{{ account.max_loss_day_pct if account.max_loss_day_pct is not none else '' }}">
+        <label for="max_loss_day">Max loss per day (₹, blank = no cap)</label>
+        <input id="max_loss_day" name="max_loss_day" inputmode="decimal" value="{{ account.max_loss_day if account.max_loss_day is not none else '' }}">
       </div>
       <div class="field">
         <label for="paper_balance">Paper balance (₹)</label>
         <input id="paper_balance" name="paper_balance" inputmode="decimal" value="{{ account.paper_balance }}" required>
       </div>
-      <div class="field">
-        <label for="telegram_chat">Telegram chat id</label>
-        <input id="telegram_chat" name="telegram_chat" inputmode="numeric" value="{{ account.owner_telegram or '' }}" placeholder="message the bot, then paste the id" autocomplete="off">
-      </div>
     </div>
-    <p class="muted">Trade updates for this account go to that Telegram chat, not the update group. Message the bot in private and it replies with the chat id. The same id is used for every account you own. Leave it blank to send no trade update.</p>
-    {% if account.max_loss_day_pct %}
-    <p class="muted">{{ account.max_loss_day_pct }}% of this paper balance is ₹{{ '{:,.0f}'.format(account.paper_balance * account.max_loss_day_pct / 100) }}. Live accounts use the broker's cash at the check. When the day's loss reaches that amount, the kill switch turns on.</p>
-    {% endif %}
-    <p class="muted">Lot size is the admin range this balance falls in. Live orders use the broker's cash at the moment of the order, and an open position does not change the next lot size. Paper lot size at the saved balance:{% for item in lot_preview %} {{ item.label }} {{ item.lots }}{% if not loop.last %},{% endif %}{% endfor %}.</p>
+    <p class="muted">Lot size is this balance divided by the admin amount for the symbol, rounded down. Live orders use the broker's cash at the moment of the order, and an open position does not change the next lot size. Paper lot size at the saved balance:{% for item in lot_preview %} {{ item.label }} {{ item.lots }}{% if not loop.last %},{% endif %}{% endfor %}.</p>
     <div class="checks">
       <label class="check"><input type="checkbox" name="enabled" value="1" {% if account.enabled %}checked{% endif %}> Enabled for copy</label>
       <label class="check"><input type="checkbox" name="auto_kill" value="1" {% if account.auto_kill %}checked{% endif %}> Auto kill switch when the day's loss limit is hit</label>

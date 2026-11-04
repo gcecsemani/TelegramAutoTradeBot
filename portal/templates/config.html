@@ -5,56 +5,48 @@
   <div>
     <p class="kicker">Admin</p>
     <h1>Lot size and slippage</h1>
-    <p class="lede">These rules apply to every account. A named symbol replaces <code>*</code>. Lot size is the range this account's cash falls in. Both ends count. Cash already in a position is not subtracted, so one trade does not shrink or block the next. It only chooses the lot size.</p>
+    <p class="lede">These rules apply to every account. A named symbol replaces <code>*</code>. Lot size is the account's cash divided by the amount below, rounded down. Cash already in a position is not subtracted, so one trade does not shrink or block the next. It only chooses the lot size.</p>
   </div>
 </div>
 
 <section class="card">
-  <h2>Balance ranges</h2>
-  <p class="lede">NIFTY, SENSEX and BANKNIFTY start at ₹35,000–₹50,000 for 1 lot, then step up. CRUDE, GOLD, SILVER, natural gas and every other name use <code>*</code>, which starts at ₹100,000–₹199,999 for 1 lot. A balance outside every range for that symbol takes no trade. Add the next range here when you want a higher lot count.</p>
+  <h2>Rupees for one lot</h2>
+  <p class="lede">NIFTY, SENSEX and BANKNIFTY start at ₹50,000. CRUDE, GOLD, SILVER, natural gas and every other stock option use the <code>*</code> row, which starts at ₹100,000. Change either amount here.</p>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Symbol</th><th class="num">From</th><th class="num">To</th><th class="num">Lots</th><th></th></tr></thead>
+      <thead><tr><th>Symbol</th><th class="num">Cash for 1 lot</th><th></th></tr></thead>
       <tbody>
-        {% for band in bands %}
+        {% for rule in margins %}
         <tr>
-          <td>{% if band.symbol == '*' %}All other symbols{% else %}{{ band.symbol }}{% endif %}</td>
-          <td class="num">₹{{ '{:,.0f}'.format(band.min_balance) }}</td>
-          <td class="num">₹{{ '{:,.0f}'.format(band.max_balance) }}</td>
-          <td class="num">{{ band.lots }}</td>
+          <td>{% if rule.symbol == '*' %}All other symbols{% else %}{{ rule.symbol }}{% endif %}</td>
+          <td class="num">₹{{ '{:,.0f}'.format(rule.rupees_per_lot) }}</td>
           <td>
-            <form method="post" action="/config/lot-band/delete">
+            {% if rule.symbol != '*' %}
+            <form method="post" action="/config/margin/delete">
               <input type="hidden" name="csrf" value="{{ csrf }}">
-              <input type="hidden" name="band_id" value="{{ band.id }}">
+              <input type="hidden" name="symbol" value="{{ rule.symbol }}">
               <button class="ghost" type="submit">Remove</button>
             </form>
+            {% endif %}
           </td>
         </tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
-  <form class="rule-form" method="post" action="/config/lot-band">
+  <form class="rule-form" method="post" action="/config/margin">
     <input type="hidden" name="csrf" value="{{ csrf }}">
-    <div class="grid bands">
+    <div class="grid">
       <div class="field">
-        <label for="band_symbol">Symbol</label>
-        <input id="band_symbol" name="symbol" placeholder="NIFTY or *" required autocomplete="off">
+        <label for="margin_symbol">Symbol</label>
+        <input id="margin_symbol" name="symbol" placeholder="NIFTY or *" required autocomplete="off">
       </div>
       <div class="field">
-        <label for="min_balance">Minimum balance</label>
-        <input id="min_balance" name="min_balance" inputmode="decimal" placeholder="35000" required>
-      </div>
-      <div class="field">
-        <label for="max_balance">Maximum balance</label>
-        <input id="max_balance" name="max_balance" inputmode="decimal" placeholder="50000" required>
-      </div>
-      <div class="field">
-        <label for="lots">Lots</label>
-        <input id="lots" name="lots" inputmode="numeric" placeholder="1" required>
+        <label for="rupees_per_lot">Rupees for 1 lot</label>
+        <input id="rupees_per_lot" name="rupees_per_lot" inputmode="decimal" placeholder="50000" required>
       </div>
     </div>
-    <p class="form-actions"><button type="submit">Save lot range</button></p>
+    <p class="form-actions"><button type="submit">Save lot amount</button></p>
   </form>
 </section>
 

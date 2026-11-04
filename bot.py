@@ -17,7 +17,6 @@ A reply of Buy Above / Near / CMP on a message that only names the option
 from __future__ import annotations
 
 import csv
-import io
 import json
 import os
 import threading
@@ -32,7 +31,7 @@ from data.instruments import InstrumentMaster
 from data.kite_gateway import KiteGateway, TokenExpired
 from execution.engine import CopyEngine
 from notify.telegram import TelegramClient, TelegramError, esc, ref
-from paper_trader import JOURNAL_COLUMNS, OPEN, PENDING, PaperTrader, money, one_lot_rows
+from paper_trader import OPEN, PENDING, PaperTrader, money
 from signal_parser import BuyCall, parse, parse_command
 
 log = get("bot")
@@ -45,14 +44,8 @@ class SignalBot:
         self.tg = TelegramClient()
         self.gw = KiteGateway()
         self.instruments = InstrumentMaster(self.gw)
-        self.copy_engine = CopyEngine(
-            notify=lambda text: self.notify(text, None, None),
-            notify_account=self._notify_owner,
-        )
-        self.trader = PaperTrader(
-            self.gw, self.instruments, self.notify, copy=self.copy_engine.handle,
-            on_closed=self._publish_trades,
-        )
+        self.copy_engine = CopyEngine(notify=lambda text: self.notify(text, None, None))
+        self.trader = PaperTrader(self.gw, self.instruments, self.notify, copy=self.copy_engine.handle)
         self._stop = threading.Event()
         self._monitor: Optional[threading.Thread] = None
         self._last_catch_up = 0.0
@@ -68,23 +61,6 @@ class SignalBot:
         if position_id:
             on_sent = lambda sent_ref: self.trader.link(position_id, sent_ref)  # noqa: E731
         self.tg.send(text, reply_to, on_sent)
-
-    def _notify_owner(self, account: dict, text: str) -> None:
-        """A linked account's trade update goes to that owner's chat, not the group."""
-        chat = str(account.get("owner_telegram") or "").strip()
-        if not chat:
-            log.warning("No Telegram chat saved for %s; trade update not sent",
-                        account.get("label") or account.get("id"))
-            return
-        self.tg.send(text, chat_id=chat)
-
-    def _private_chat(self, chat: str) -> None:
-        self.tg.send(
-            f"This chat id is <code>{esc(chat)}</code>.\n"
-            "Paste it into <b>Telegram chat id</b> on your account in the portal. "
-            "Trade updates for your linked account come here.",
-            chat_id=chat,
-        )
 
     # ─── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -289,14 +265,10 @@ class SignalBot:
             self.tg.migrated(chat, str(msg["migrate_to_chat_id"]))
             return
         in_signal = chat in self.tg.signal_chats
+        if not in_signal and chat != self.tg.update_chat:
+            return
         sender = msg.get("from") or {}
         if sender.get("is_bot"):
-            return
-        chat_type = (msg.get("chat") or {}).get("type") or ""
-        if chat_type == "private" and not in_signal and chat != self.tg.update_chat:
-            self._private_chat(chat)
-            return
-        if not in_signal and chat != self.tg.update_chat:
             return
         # Channel posts are published as the channel, so they have no user id.
         if (config.TELEGRAM_ALLOWED_USER_IDS and sender.get("id")
@@ -399,33 +371,23 @@ class SignalBot:
         elif command == "PNL":
             self.notify(self.trader.pnl_report(), msg_ref)
         elif command == "TRADES":
-            self._send_trades_csv(msg_ref)
-
-    def _publish_trades(self, pos) -> None:
-        self._send_trades_csv(getattr(pos, "signal_ref", None) or None)
-
-    def _send_trades_csv(self, reply_to: Optional[str]) -> None:
-        """Send the journal with every trade's profit or loss restated for 1 lot."""
-        path = config.PATHS["trade_journal"]
-        try:
-            with open(path, newline="", encoding="utf-8") as fh:
-                rows = list(csv.DictReader(fh))
-        except OSError:
-            rows = []
-        if not rows:
-            self.notify("📎 No closed trades yet — trades.csv is empty.", reply_to)
-            return
-        scaled = one_lot_rows(rows)
-        buffer = io.StringIO()
-        writer = csv.DictWriter(buffer, fieldnames=JOURNAL_COLUMNS, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(scaled)
-        total = sum(float(row["pnl"]) for row in scaled)
-        first, last = rows[0]["exit_time"][:10], rows[-1]["exit_time"][:10]
-        self.tg.send_document(
-            f"trades_{clock.datestamp()}.csv", buffer.getvalue().encode("utf-8"),
-            f"📎 <b>trades.csv</b> · {len(scaled)} closed trades · {esc(first)} → {esc(last)}\n"
-            f"P&amp;L for 1 lot {money(total)}", reply_to)
+            path = config.PATHS["trade_journal"]
+            try:
+                with open(path, "rb") as fh:
+                    content = fh.read()
+                with open(path, newline="", encoding="utf-8") as fh:
+                    rows = list(csv.DictReader(fh))
+            except OSError:
+                rows, content = [], b""
+            if not rows:
+                self.notify("📎 No closed trades yet — trades.csv is empty.", msg_ref)
+                return
+            total = sum(float(row.get("pnl") or 0) for row in rows)
+            first, last = rows[0]["exit_time"][:10], rows[-1]["exit_time"][:10]
+            self.tg.send_document(
+                f"trades_{clock.datestamp()}.csv", content,
+                f"📎 <b>trades.csv</b> · {len(rows)} closed trades · {esc(first)} → {esc(last)}\n"
+                f"Net P&amp;L {money(total)}", msg_ref)
 
 
 def _said(text: str) -> str:
