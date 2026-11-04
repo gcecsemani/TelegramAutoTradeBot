@@ -334,18 +334,44 @@ class OrderTests(unittest.TestCase):
             ))
         self.assertFalse(any("/place" in call[1] for call in http.calls))
 
-    def test_an_nfo_stop_stays_a_stop_market(self):
+    def test_nfo_stops_are_stop_limits(self):
         working = _Response(200, {"data": {"nOrdNo": "9003", "ordSt": "trigger pending"}})
         broker, http = self._broker([
+            ("/positions", _Response(200, {"data": [{
+                "trdSym": "NIFTY09NOV2624000CE", "prod": "MIS",
+                "flBuyQty": "130", "flSellQty": "0",
+            }]})),
             ("/place", _Response(200, {"stat": "Ok", "nOrdNo": "9003"})),
             ("/user/orders", working),
-        ], symbols=lambda exchange, symbol: "NIFTY-STOP")
-        broker.place(_order(order_type="SL-M", price=0, trigger_price=80, tag="tag"))
-        sent = json.loads(http.calls[0][4]["jData"])
+        ], symbols=lambda exchange, symbol: "NIFTY09NOV2624000CE")
+        view = broker.place(_order(
+            tradingsymbol="NIFTY26N0924000CE", side="SELL", order_type="SL-M",
+            price=0, quantity=130, trigger_price=80, validity="DAY", tag="tag",
+        ))
+        self.assertEqual(view.status, "OPEN")
+        sent = json.loads(http.calls[1][4]["jData"])
         self.assertEqual(sent["es"], "nse_fo")
-        self.assertEqual(sent["pt"], "SL-M")
-        self.assertEqual(sent["pr"], "0")
+        self.assertEqual(sent["pt"], "SL")
         self.assertEqual(sent["tp"], "80.00")
+        self.assertEqual(sent["pr"], "76.00")
+        self.assertEqual(sent["tt"], "S")
+        self.assertEqual(sent["qt"], "130")
+        self.assertEqual(sent["pc"], "MIS")
+
+    def test_an_nfo_stop_move_stays_a_limit_stop(self):
+        book = _Response(200, {"data": [{
+            "nOrdNo": "9003", "ordSt": "trigger pending", "exSeg": "nse_fo", "prcTp": "SL",
+        }]})
+        broker, http = self._broker([
+            ("/user/orders", book),
+            ("/modify", _Response(200, {"stat": "Ok", "nOrdNo": "9003"})),
+        ])
+        broker.modify("9003", 80, 130)
+        sent = json.loads(http.calls[1][4]["jData"])
+        self.assertEqual(sent["pt"], "SL")
+        self.assertEqual(sent["tp"], "80.00")
+        self.assertEqual(sent["pr"], "76.00")
+        self.assertEqual(sent["qt"], "130")
 
     def test_recovery_finds_the_order_by_its_tag(self):
         book = _Response(200, {"data": [

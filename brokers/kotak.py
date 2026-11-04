@@ -174,7 +174,8 @@ class KotakBroker:
         if order.side == "SELL":
             product, quantity = self._close_buy(symbol, product, quantity)
         if _stop_limit_segment(segment) and order.order_type == "SL-M":
-            # MCX and BSE FO reject a stop-market. A sell stop-limit sits under the trigger.
+            # Kotak rejects a stop-market on MCX, BSE FO, and NSE options.
+            # A sell stop-limit sits under the trigger.
             order_type = "SL"
             price = _px(sell_stop_limit(order.trigger_price))
             trigger = _px(order.trigger_price)
@@ -667,7 +668,7 @@ def _whole(value) -> int:
 
 
 def sell_stop_limit(trigger: float, buffer: float = 0.05) -> float:
-    """Limit under a sell trigger. Kotak MCX and BSE FO options refuse a stop-market."""
+    """Limit under a sell trigger. Kotak refuses a stop-market on these options."""
     trigger = round(float(trigger or 0), 2)
     if trigger <= 0:
         return 0.0
@@ -681,14 +682,14 @@ def sell_stop_limit(trigger: float, buffer: float = 0.05) -> float:
 
 
 def _stop_limit_segment(segment: str) -> bool:
-    return segment in ("mcx_fo", "bse_fo")
+    return segment in ("mcx_fo", "bse_fo", "nse_fo")
 
 
 def _stop_limit_order(row) -> bool:
     if not isinstance(row, dict):
         return False
     segment = str(row.get("exSeg") or row.get("es") or row.get("exc") or "").lower()
-    return "mcx" in segment or "bse_fo" in segment or segment == "bfo"
+    return "mcx" in segment or "nse_fo" in segment or "bse_fo" in segment or segment == "bfo"
 
 
 def _order_type(kind: str) -> str:
