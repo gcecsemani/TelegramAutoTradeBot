@@ -100,6 +100,8 @@ class Harness(unittest.TestCase):
         for key in ("positions", "telegram_offset", "trade_journal", "ledger_daily", "ledger_monthly"):
             config.PATHS[key] = os.path.join(self.tmp, os.path.basename(config.PATHS[key]))
         self._now = clock.now
+        self._paper = config.NOTIFY.get("paper_book")
+        config.NOTIFY["paper_book"] = True
         self.set_time(10, 0)
 
         from bot import SignalBot
@@ -117,6 +119,7 @@ class Harness(unittest.TestCase):
         self.msg_id = 100
 
     def tearDown(self):
+        config.NOTIFY["paper_book"] = self._paper
         clock.now = self._now
         config.PATHS.clear()
         config.PATHS.update(self._paths)

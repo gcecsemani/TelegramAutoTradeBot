@@ -100,7 +100,9 @@ The `.env` Zerodha key is only the quote login. Orders go to accounts linked in 
 
 A signal is decided once, from the live quote. That decision is then copied, in parallel, to every enabled account. One account's rejection or dead token does not stop the others.
 
-Each copy writes an order intent before calling the broker. The intent key is unique, and a Zerodha order is tagged with it. If the process dies after the send, recovery looks the order up by that tag instead of sending it again. Buys are limit + IOC at the admin slippage cap. Exits are market orders. A kill switch stops new buys immediately; exits still go out.
+Each copy writes an order intent before calling the broker. The intent key is unique, and a Zerodha order is tagged with it. If the process dies after the send, recovery looks the order up by that tag instead of sending it again. Zerodha is the only broker that places orders. A kill switch stops new buys immediately; exits still go out.
+
+A live Zerodha buy follows the call. Buy CMP is a market order. Buy above, buy near, and buy only are limit orders that rest for the day: above and near use the signal price plus the admin slippage, and buy only uses that price with no slippage. MCX buys are NRML. MCX and BSE (BFO) orders are day orders, because those exchanges reject IOC. After the buy fills, a call with no SL gets a stop 30% under the price that account actually paid. A call that named an SL uses that price when it is still below the fill. Every sell and every stop first reads the Zerodha position. If that read fails, or there is no long, the sell is not sent, so a sell cannot open a short. Telegram posts those live orders. Paper-book fills and paper-account copies stay off Telegram. `/op`, `/pnl`, and `/trades` still reply.
 
 Lot size is the account's cash divided by the rupees configured for that symbol, rounded down. NIFTY, SENSEX and BANKNIFTY start at ₹50,000 for one lot. Every other symbol starts at ₹100,000. An open position does not reduce the cash used for the next trade; the check only chooses the lot size. The broker can still reject an order if the exchange margin is not there.
 
@@ -112,12 +114,12 @@ Lot size is the account's cash divided by the rupees configured for that symbol,
 | Max loss per day | same, and the auto kill switch can stop the account |
 | Kill switch / flatten | portal buttons. Flatten sells whatever that account still holds |
 | Quote login | admin, portal page **Quote login**, every morning. Renews the `.env` price token. The running bot reads it without a restart |
-| Daily login | each trading account, from the portal, every morning. Zerodha pastes the redirect URL. Kotak Neo enters the authenticator code |
-| Live orders | account mode **and** `LIVE_TRADING=1` |
+| Daily login | each trading account, from the portal, every morning. Zerodha pastes the redirect URL |
+| Live orders | Zerodha only, account mode **and** `LIVE_TRADING=1` |
 
-Kotak Neo uses the Trade API token as the API key, the MPIN as the secret, the UCC as the client id, and the registered mobile number. A Zerodha contract name is translated to Kotak's name before the order is sent. Dhan and Groww can be saved; they do not place orders yet.
+Kotak Neo, Dhan, and Groww can still be saved. They do not place orders.
 
-On the droplet, `deploy/telegram-bot.service` and `deploy/portal.service` run the two processes. To stop the signal bot outside market hours, disable that service and enable `deploy/market-hours.timer` instead. It starts the bot at 08:00 IST on trading days and stops it at 00:10, after the MCX close. Weekends and dates in `HOLIDAYS` stay stopped. The portal keeps running so the morning quote login still works. Leave `PORTAL_HOST=127.0.0.1` and open it with `ssh -L 8080:127.0.0.1:8080 bot@YOUR_DROPLET`. The first registered user is the admin. Set `PORTAL_INVITE_CODE` before anyone else can register.
+On the droplet, `deploy/telegram-bot.service` and `deploy/portal.service` run the two processes. To stop the signal bot outside market hours, disable that service and enable `deploy/market-hours.timer` instead. The timer runs the IST check about every minute. It starts the bot at 08:00 IST on trading days and stops it at 00:10, after the MCX close. Weekends and dates in `HOLIDAYS` stay stopped. The portal keeps running so the morning quote login still works. A `git pull` does not install the timer: copy `deploy/market-hours.timer` into systemd and reload it. Leave `PORTAL_HOST=127.0.0.1` and open it with `ssh -L 8080:127.0.0.1:8080 bot@YOUR_DROPLET`. The first registered user is the admin. Set `PORTAL_INVITE_CODE` before anyone else can register.
 
 `python3 main.py --parse "your message"` shows how a message is read (add `--reply` for a follow-up, and `--tagged "Sensex 72800 PE"` for a buy on a watchlist line).
 

@@ -76,16 +76,39 @@ class ZerodhaBroker:
         }
 
     def place(self, order: OrderRequest) -> OrderView:
+        quantity = int(order.quantity)
+        product = order.product or "MIS"
+        if order.side == "SELL":
+            product, held = self._open_long(order.exchange, order.tradingsymbol, product)
+            quantity = min(quantity, held)
+            if quantity <= 0:
+                raise BrokerError(
+                    f"No bought {order.tradingsymbol} at Zerodha, so the sell was not sent."
+                )
+        elif (order.exchange or "").upper() == "MCX":
+            product = "NRML"
+        view = self._submit(order, quantity, product, order.order_type, order.price)
+        if order.order_type == "SL-M" and view.status == "REJECTED" and _slm_blocked(view.message):
+            limit = stop_limit_price(order.trigger_price, order.tick_size)
+            view = self._submit(order, quantity, product, "SL", limit)
+        return view
+
+    def _submit(self, order: OrderRequest, quantity: int, product: str,
+                order_type: str, price: float) -> OrderView:
         side = self.kite.TRANSACTION_TYPE_BUY if order.side == "BUY" else self.kite.TRANSACTION_TYPE_SELL
-        product = self.kite.PRODUCT_MIS if order.product == "MIS" else self.kite.PRODUCT_NRML
-        if order.order_type == "SL-M":
-            order_type = self.kite.ORDER_TYPE_SLM
-        elif order.order_type == "MARKET":
-            order_type = self.kite.ORDER_TYPE_MARKET
+        kite_product = self.kite.PRODUCT_MIS if product == "MIS" else self.kite.PRODUCT_NRML
+        if order_type == "SL-M":
+            kite_type = self.kite.ORDER_TYPE_SLM
+        elif order_type == "SL":
+            kite_type = self.kite.ORDER_TYPE_SL
+        elif order_type == "MARKET":
+            kite_type = self.kite.ORDER_TYPE_MARKET
         else:
-            order_type = self.kite.ORDER_TYPE_LIMIT
+            kite_type = self.kite.ORDER_TYPE_LIMIT
         kind = order_validity(order.exchange, order.validity)
         validity = self.kite.VALIDITY_IOC if kind == "IOC" else self.kite.VALIDITY_DAY
+        send_price = price if kite_type in (self.kite.ORDER_TYPE_LIMIT, self.kite.ORDER_TYPE_SL) else None
+        send_trigger = order.trigger_price if kite_type in (self.kite.ORDER_TYPE_SL, self.kite.ORDER_TYPE_SLM) else None
         self._pace()
         try:
             order_id = self.kite.place_order(
@@ -93,11 +116,11 @@ class ZerodhaBroker:
                 exchange=order.exchange,
                 tradingsymbol=order.tradingsymbol,
                 transaction_type=side,
-                quantity=int(order.quantity),
-                product=product,
-                order_type=order_type,
-                price=order.price if order_type == self.kite.ORDER_TYPE_LIMIT else None,
-                trigger_price=order.trigger_price if order_type == self.kite.ORDER_TYPE_SLM else None,
+                quantity=int(quantity),
+                product=kite_product,
+                order_type=kite_type,
+                price=send_price,
+                trigger_price=send_trigger,
                 validity=validity,
                 tag=order.tag[:20],
             )
@@ -107,9 +130,42 @@ class ZerodhaBroker:
             raise BrokerError(str(exc)) from exc
         except Exception as exc:
             raise TransientError(str(exc)) from exc
-        if order.order_type == "SL-M":
+        if order_type in ("SL-M", "SL"):
             return self._await_working(str(order_id))
         return self._await(str(order_id))
+
+    def _open_long(self, exchange: str, tradingsymbol: str, product: str) -> tuple:
+        """Bought quantity for this contract. A failed read does not sell."""
+        self._pace()
+        try:
+            payload = self.kite.positions() or {}
+        except kite_exc.TokenException as exc:
+            raise TokenError(str(exc)) from exc
+        except Exception as exc:
+            raise BrokerError(
+                f"Zerodha positions could not be read, so the sell was not sent. {exc}"
+            ) from exc
+        wanted = (exchange or "").upper()
+        symbol = tradingsymbol or ""
+        found = []
+        for row in payload.get("net") or []:
+            if str(row.get("exchange") or "").upper() != wanted:
+                continue
+            if str(row.get("tradingsymbol") or "") != symbol:
+                continue
+            qty = int(row.get("quantity") or 0)
+            if qty <= 0:
+                continue
+            found.append((str(row.get("product") or "").upper(), qty))
+        if not found:
+            raise BrokerError(f"No bought {symbol} at Zerodha, so the sell was not sent.")
+        for held, qty in found:
+            if held == (product or "").upper() and held in ("MIS", "NRML"):
+                return held, qty
+        held, qty = max(found, key=lambda item: item[1])
+        if held in ("MIS", "NRML"):
+            return held, qty
+        return product or "NRML", qty
 
     def modify(self, order_id: str, trigger_price: float, quantity: int) -> OrderView:
         self._pace()
@@ -167,7 +223,7 @@ class ZerodhaBroker:
         matches = [row for row in rows if str(row.get("tag") or "") == tag]
         if not matches:
             return None
-        matches.sort(key=lambda row: int(row.get("filled_quantity") or 0), reverse=True)
+        matches.sort(key=_tag_rank, reverse=True)
         return _view(matches[0])
 
     def _await_working(self, order_id: str) -> OrderView:
@@ -200,10 +256,41 @@ class ZerodhaBroker:
 
 
 def order_validity(exchange: str, validity: str) -> str:
-    """MCX rejects IOC. Other exchanges keep the validity the engine asked for."""
-    if (exchange or "").upper() == "MCX":
+    """MCX and BFO reject IOC. NFO keeps the validity the engine asked for."""
+    if (exchange or "").upper() in ("MCX", "BFO", "BSE"):
         return "DAY"
     return "IOC" if (validity or "").upper() == "IOC" else "DAY"
+
+
+def stop_limit_price(trigger: float, tick: float = 0.05) -> float:
+    """Sell limit under the trigger. Kite rejects a sell stop whose limit is above it."""
+    tick = tick if tick and tick > 0 else 0.05
+    steps = int((float(trigger) * 0.95) / tick)
+    price = round(steps * tick, 2)
+    if price <= 0 or price >= float(trigger):
+        price = round(float(trigger) - tick, 2)
+    return price
+
+
+def _slm_blocked(message: str) -> bool:
+    text = (message or "").lower()
+    if "sl-m" in text or "stop loss market" in text or "stop-loss market" in text:
+        return "not allowed" in text or "not permitted" in text or "blocked" in text
+    return False
+
+
+def _tag_rank(row: dict) -> tuple:
+    status = str(row.get("status") or "").upper()
+    filled = int(row.get("filled_quantity") or 0)
+    if status == "COMPLETE" or filled > 0:
+        band = 3
+    elif status in ("OPEN", "TRIGGER PENDING", "MODIFY PENDING", "OPEN PENDING"):
+        band = 2
+    elif status == "REJECTED":
+        band = 0
+    else:
+        band = 1
+    return (band, filled)
 
 
 def cash_from_margins(payload: dict, exchange: str) -> float:

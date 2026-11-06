@@ -45,7 +45,7 @@ class SignalBot:
         self.gw = KiteGateway()
         self.instruments = InstrumentMaster(self.gw)
         self.copy_engine = CopyEngine(notify=lambda text: self.notify(text, None, None))
-        self.trader = PaperTrader(self.gw, self.instruments, self.notify, copy=self.copy_engine.handle)
+        self.trader = PaperTrader(self.gw, self.instruments, self._book_notify, copy=self.copy_engine.handle)
         self._stop = threading.Event()
         self._monitor: Optional[threading.Thread] = None
         self._last_catch_up = 0.0
@@ -61,6 +61,12 @@ class SignalBot:
         if position_id:
             on_sent = lambda sent_ref: self.trader.link(position_id, sent_ref)  # noqa: E731
         self.tg.send(text, reply_to, on_sent)
+
+    def _book_notify(self, text: str, reply_to: Optional[str] = None, position_id: Optional[str] = None) -> None:
+        """Paper-book fills stay off Telegram. Commands and live copies still post."""
+        if not config.NOTIFY.get("paper_book"):
+            return
+        self.notify(text, reply_to, position_id)
 
     # ─── Lifecycle ────────────────────────────────────────────────────────────
 

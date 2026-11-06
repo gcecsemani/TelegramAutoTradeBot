@@ -29,6 +29,7 @@ class OrderRequest:
     validity: str                        # IOC / DAY
     tag: str
     trigger_price: float = 0.0           # sell stop trigger for SL-M
+    tick_size: float = 0.05
 
 
 @dataclass(frozen=True)

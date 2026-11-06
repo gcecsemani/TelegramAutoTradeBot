@@ -160,6 +160,8 @@ NOTIFY: dict = {
     "max_msgs_per_min":  18,
     "retry_attempts":    3,
     "timeout_sec":       20,
+    # The signal book is paper. Telegram only gets live broker orders.
+    "paper_book":        False,
 }
 
 

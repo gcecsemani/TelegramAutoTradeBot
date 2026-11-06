@@ -89,6 +89,7 @@ class RiskTests(unittest.TestCase):
         self.assertRaises(BrokerError, cash_from_margins, {}, "NFO")
         self.assertEqual(order_validity("NFO", "IOC"), "IOC")
         self.assertEqual(order_validity("MCX", "IOC"), "DAY")
+        self.assertEqual(order_validity("BFO", "IOC"), "DAY")
 
         kotak = [
             {"Category": "FO", "Net": "40000", "MarginUsed": "110000"},
@@ -281,7 +282,7 @@ class FanoutTests(unittest.TestCase):
         again = store.buy_intent(self.one, "pos-live-again")
         self.assertEqual(again["lots"], 4)
 
-    def test_live_kotak_mcx_orders_the_board_lot_and_books_the_same_lots(self):
+    def test_a_live_kotak_account_is_not_sent(self):
         class Live:
             def __init__(self):
                 self.quantities = []
@@ -289,26 +290,9 @@ class FanoutTests(unittest.TestCase):
             def cash_balance(self, exchange):
                 return 200000
 
-            def board_lot(self, exchange, symbol):
-                return 10
-
             def place(self, order):
                 self.quantities.append(order.quantity)
-                if order.order_type == "SL-M":
-                    return OrderView(f"sl-{order.tag}", "OPEN", 0, 0, "stop")
                 return OrderView("OID", "COMPLETE", order.price or 480, order.quantity, "accepted")
-
-            def find_by_tag(self, tag):
-                return None
-
-            def fetch(self, order_id):
-                return None
-
-            def cancel(self, order_id):
-                return OrderView(order_id, "CANCELLED", 0, 0, "cancelled")
-
-            def modify(self, order_id, trigger_price, quantity):
-                return OrderView(order_id, "OPEN", 0, 0, "modified")
 
         config.LIVE_TRADING = True
         store.update_account(self.one, self.user, {"mode": "live", "broker": "kotak"})
@@ -319,31 +303,82 @@ class FanoutTests(unittest.TestCase):
         live = Live()
         paper = copy_engine.build_broker(store.get_account(self.two))
         self.engine.broker_factory = lambda account: live if account["id"] == self.one else paper
-        crude = dict(
+        self.engine.handle(_event(
             position_id="crude-mini", symbol="CRUDEOILM", exchange="MCX",
             tradingsymbol="CRUDEOILM26NOV9300PE", lot_size=1, multiplier=10,
             price=480.55, sl=333.05, exact=True,
-        )
-        self.engine.handle(_event(**crude))
+        ))
         bought = store.buy_intent(self.one, "crude-mini")
         paper_buy = store.buy_intent(self.two, "crude-mini")
-        self.assertEqual(bought["status"], "FILLED")
-        self.assertEqual(bought["lots"], 2)
-        self.assertEqual(bought["quantity"], 20)
-        self.assertEqual(live.quantities[0], 20)
-        self.assertEqual(store.get_leg(self.one, "crude-mini")["lots_open"], 2)
-        self.assertEqual(paper_buy["quantity"], 2)
-        self.assertEqual(store.get_leg(self.two, "crude-mini")["lots_open"], 2)
+        self.assertEqual(bought["status"], "SKIPPED")
+        self.assertIn("cannot place", bought["reason"])
+        self.assertEqual(live.quantities, [])
+        self.assertEqual(paper_buy["status"], "FILLED")
+
+    def test_live_zerodha_buys_match_the_call_and_the_fill_sets_the_stop(self):
+        class Tape:
+            def __init__(self):
+                self.orders = []
+
+            def cash_balance(self, exchange):
+                return 200000
+
+            def place(self, order):
+                self.orders.append(order)
+                if order.order_type == "SL-M":
+                    return OrderView(f"sl-{order.tag}", "OPEN", 0, 0, "stop")
+                fill = order.price or 102
+                return OrderView("OID", "COMPLETE", fill, order.quantity, "accepted")
+
+            def find_by_tag(self, tag):
+                return None
+
+        config.LIVE_TRADING = True
+        store.update_account(self.one, self.user, {"mode": "live", "broker": "zerodha"})
+        store.set_token(self.one, "token", "AB1234")
+        tape = Tape()
+        self.engine.broker_factory = lambda account: tape
+
+        self.engine.handle(_event(position_id="cmp", entry="CMP", sl=80))
+        self.assertEqual(tape.orders[0].order_type, "MARKET")
+        self.assertEqual(tape.orders[0].validity, "DAY")
+        self.assertEqual(tape.orders[0].price, 0.0)
+        self.assertEqual(tape.orders[1].order_type, "SL-M")
+        self.assertEqual(tape.orders[1].side, "SELL")
+        self.assertEqual(tape.orders[1].trigger_price, 80.0)
+
+        tape.orders.clear()
+        self.engine.handle(_event(position_id="above", entry="ABOVE", price=100, sl=80))
+        self.assertEqual(tape.orders[0].order_type, "LIMIT")
+        self.assertEqual(tape.orders[0].validity, "DAY")
+        self.assertEqual(tape.orders[0].price, 101.0)
+
+        tape.orders.clear()
+        self.engine.handle(_event(position_id="near", entry="NEAR", price=100, sl=80))
+        self.assertEqual(tape.orders[0].order_type, "LIMIT")
+        self.assertEqual(tape.orders[0].validity, "DAY")
+        self.assertEqual(tape.orders[0].price, 101.0)
+
+        tape.orders.clear()
+        self.engine.handle(_event(position_id="only", entry="ONLY", exact=True, price=100, sl=70))
+        self.assertEqual(tape.orders[0].order_type, "LIMIT")
+        self.assertEqual(tape.orders[0].price, 100.0)
+        self.assertEqual(tape.orders[1].trigger_price, 70.0)
+
+        tape.orders.clear()
+        self.engine.handle(_event(position_id="default-sl", entry="CMP", sl=70, sl_default=True))
+        stops = [order for order in tape.orders if order.order_type == "SL-M"]
+        self.assertEqual(stops[0].trigger_price, 71.4)
 
         self.engine.handle(_event(
-            action="SELL", lots=2, lots_before=2, price=490.55, reason="BOOK",
-            position_id="crude-mini", symbol="CRUDEOILM", exchange="MCX",
-            tradingsymbol="CRUDEOILM26NOV9300PE", lot_size=1, multiplier=10,
+            action="SELL", position_id="cmp", lots=2, lots_before=2, price=110, reason="BOOK",
         ))
-        self.assertEqual(live.quantities[-1], 20)
-        self.assertEqual(store.get_leg(self.one, "crude-mini")["lots_open"], 0)
-        self.assertEqual(store.day_realized(self.one), store.day_realized(self.two))
-        self.assertEqual(store.day_realized(self.one), 200.0)
+        sells = [order for order in tape.orders if order.side == "SELL" and order.order_type == "MARKET"]
+        self.assertEqual(len(sells), 1)
+        self.assertEqual(sells[0].validity, "DAY")
+        posted = "\n".join(self.notes)
+        self.assertIn("Copy BUY", posted)
+        self.assertNotIn("· paper", posted)
 
     def test_an_exact_price_buy_does_not_add_slippage(self):
         self.engine.handle(_event(position_id="pos-exact", price=100, exact=True))

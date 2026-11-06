@@ -2,9 +2,12 @@
 Description=Keep the signal bot inside market hours
 
 [Timer]
-OnBootSec=1min
-OnUnitActiveSec=5min
-AccuracySec=30s
+# The python check uses IST. Running it every minute means 08:00 is not
+# missed because a 5-minute timer last fired at 07:56.
+OnBootSec=30s
+OnUnitActiveSec=1min
+AccuracySec=5s
+Persistent=true
 
 [Install]
 WantedBy=timers.target

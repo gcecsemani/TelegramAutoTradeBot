@@ -23,3 +23,5 @@ class CopyEvent:
     reason: str
     signal_ref: str
     exact: bool = False                  # limit at price exactly; ignore admin slippage
+    entry: str = "CMP"                   # CMP / ABOVE / NEAR / RANGE / ONLY
+    sl_default: bool = False             # stop is 30% under the live fill, not a price from the call

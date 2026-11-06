@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS intents (
     filled_qty INTEGER NOT NULL DEFAULT 0,
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT NOT NULL DEFAULT '',
+    tick REAL NOT NULL DEFAULT 0.05,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -152,6 +153,8 @@ def init() -> None:
         intent_cols = {row[1] for row in conn.execute("PRAGMA table_info(intents)")}
         if "stop_trigger" not in intent_cols:
             conn.execute("ALTER TABLE intents ADD COLUMN stop_trigger REAL NOT NULL DEFAULT 0")
+        if "tick" not in intent_cols:
+            conn.execute("ALTER TABLE intents ADD COLUMN tick REAL NOT NULL DEFAULT 0.05")
         leg_cols = {row[1] for row in conn.execute("PRAGMA table_info(legs)")}
         for name, typedef in (
             ("sl_order_id", "TEXT NOT NULL DEFAULT ''"),
@@ -463,14 +466,14 @@ def claim_intent(row: dict) -> bool:
                 """INSERT INTO intents (
                        idempotency_key, account_id, position_id, action, symbol, exchange,
                        tradingsymbol, lots, quantity, multiplier, order_type, limit_price,
-                       product, tag, stop_trigger, status, reason, created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       product, tag, stop_trigger, status, reason, tick, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     row["idempotency_key"], row["account_id"], row["position_id"], row["action"],
                     row["symbol"], row["exchange"], row["tradingsymbol"], row["lots"], row["quantity"],
                     row.get("multiplier") or 1, row["order_type"], row.get("limit_price") or 0,
                     row["product"], row["tag"], row.get("stop_trigger") or 0, row["status"],
-                    row.get("reason") or "", now, now,
+                    row.get("reason") or "", row.get("tick") or 0.05, now, now,
                 ),
             )
             conn.execute("COMMIT")

@@ -464,6 +464,8 @@ class PaperTrader:
             lot_size=pos.lot_size, lots=pos.lots, lots_before=pos.lots, price=price, sl=pos.sl,
             reason="ENTRY", signal_ref=pos.signal_ref,
             exact=pos.mode == "ONLY",
+            entry=pos.mode or "CMP",
+            sl_default="default" in (pos.sl_note or "").lower(),
         ))
         self._notify_opened(pos, reply_to)
         return ""

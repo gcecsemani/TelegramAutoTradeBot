@@ -1,8 +1,8 @@
 """
 Which brokers can send an order today.
 
-Zerodha and Kotak Neo place orders. Dhan and Groww can be saved now; their
-adapters refuse to place an order until they exist.
+Zerodha places orders. Kotak Neo, Dhan and Groww can be saved; they do not
+place orders.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from typing import Dict
 
 BROKERS: Dict[str, dict] = {
     "zerodha": {"label": "Zerodha", "live": True, "daily_auth": True},
-    "kotak":   {"label": "Kotak Neo", "live": True, "daily_auth": True},
+    "kotak":   {"label": "Kotak Neo", "live": False, "daily_auth": False},
     "dhan":    {"label": "Dhan",    "live": False, "daily_auth": False},
     "groww":   {"label": "Groww",   "live": False, "daily_auth": False},
 }
