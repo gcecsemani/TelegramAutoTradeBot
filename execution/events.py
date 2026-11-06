@@ -25,3 +25,4 @@ class CopyEvent:
     exact: bool = False                  # limit at price exactly; ignore admin slippage
     entry: str = "CMP"                   # CMP / ABOVE / NEAR / RANGE / ONLY
     sl_default: bool = False             # stop is 30% under the live fill, not a price from the call
+    buy_pct: float = 100.0               # 100, 50, or 25. Slice of this account's full size

@@ -103,6 +103,30 @@ class BuyCallTests(unittest.TestCase):
         parsed = parse("NIFTY 22800PE\nbuy near 105-100")
         self.assertEqual((parsed.call.level, parsed.call.level_high), (100, 105))
 
+    def test_a_split_buy_is_25_or_50_of_the_same_entries(self):
+        samples = (
+            ("NIFTY 22800PE\nBuy 25% CMP", "CMP", None, 25),
+            ("NIFTY 22800PE\nBuy 50% Above 100", "ABOVE", 100, 50),
+            ("NIFTY 22800PE\nBuy 25% Near 90", "NEAR", 90, 25),
+            ("NIFTY 22800PE\nBuy 50% Near 100-105", "RANGE", 100, 50),
+            ("NIFTY 22800PE\nBuy 25% only 100", "ONLY", 100, 25),
+            ("NIFTY 22800PE\nBuy 50% only 100", "ONLY", 100, 50),
+            ("Nifty 22700 Pe buy 25% @ 85 only", "ONLY", 85, 25),
+        )
+        for text, mode, level, pct in samples:
+            parsed = parse(text)
+            self.assertEqual(parsed.kind, "BUY", text)
+            call = parsed.call
+            self.assertEqual((call.mode, call.level, call.buy_pct), (mode, level, pct), text)
+        ranged = parse("NIFTY 22800PE\nBuy 25% Near 100-105").call
+        self.assertEqual(ranged.level_high, 105)
+        self.assertEqual(parse("NIFTY 22800PE\nBuy 25% only 100").call.entry_line(), "Buy 25% only 100")
+        tagged = parse("Buy 25% only 100", is_reply=True, tagged="SENSEX 72800 PE")
+        self.assertEqual((tagged.call.mode, tagged.call.level, tagged.call.buy_pct), ("ONLY", 100, 25))
+        for text in ("NIFTY 22800PE\nBuy 10% CMP", "NIFTY 22800PE\nBuy 75% Above 100", "NIFTY 22800PE\nBuy 100% CMP"):
+            self.assertEqual(parse(text).kind, "INVALID", text)
+        self.assertEqual(parse("NIFTY 22800PE\nBuy CMP").call.buy_pct, 100)
+
     def test_entry_rules(self):
         from paper_trader import PaperTrader, Position, Quote
         pos = Position(

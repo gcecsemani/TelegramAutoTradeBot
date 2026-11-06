@@ -27,6 +27,23 @@ class BuyPlan:
     reason: str
 
 
+def portion_lots(full: int, pct: float) -> int:
+    """25% or 50% of the account's full size. Under one lot still buys one."""
+    full = int(full or 0)
+    if full < 1:
+        return 0
+    try:
+        share = float(pct or 100)
+    except (TypeError, ValueError):
+        share = 100.0
+    if share >= 100:
+        return full
+    sliced = int(full * share // 100)
+    if sliced < 1:
+        return 1
+    return min(full, sliced)
+
+
 def lots_for_balance(balance: float, rupees_per_lot: float) -> int:
     """How many lots this cash pays for. Rounded down. Open positions are not an input."""
     try:

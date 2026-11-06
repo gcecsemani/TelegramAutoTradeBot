@@ -123,6 +123,7 @@ class Position:
     level_high: float = 0.0              # Buy Near 100-105 buys at or below this
     book_level: float = 0.0              # sell when LTP reaches this; 0 = off
     book_pct: float = 0.0                # 100 = all, 50 = half, with book_level
+    buy_pct: float = 100.0               # 100, 50, or 25 of each account's full size
     initial_lots: int = 0
     sl: Optional[float] = None
     no_sl: bool = False
@@ -176,13 +177,14 @@ class Position:
         return "none"
 
     def entry_text(self) -> str:
+        share = "" if self.buy_pct >= 100 else f"{self.buy_pct:g}% "
         if self.mode == "CMP":
-            return "Buy CMP"
+            return f"Buy {share}CMP"
         if self.mode == "ONLY":
-            return f"Buy only {self.level:g}"
+            return f"Buy {share}only {self.level:g}"
         if self.mode == "RANGE":
-            return f"Buy Near {self.level:g}-{self.level_high:g}"
-        return f"Buy {self.mode.title()} {self.level:g}"
+            return f"Buy {share}Near {self.level:g}-{self.level_high:g}"
+        return f"Buy {share}{self.mode.title()} {self.level:g}"
 
 
 def _signal_with_entry(text: str, call: BuyCall) -> str:
@@ -383,6 +385,7 @@ class PaperTrader:
             level_high=float(call.level_high or 0),
             book_level=float(call.book_level or 0),
             book_pct=float(call.book_pct or 0) if call.book_level else 0.0,
+            buy_pct=float(call.buy_pct or 100),
             sl=call.sl,
             no_sl=call.no_sl,
             targets=list(call.targets),
@@ -462,10 +465,12 @@ class PaperTrader:
             action="BUY", position_id=pos.id, symbol=pos.symbol, exchange=pos.exchange,
             tradingsymbol=pos.tradingsymbol, tick_size=pos.tick_size, multiplier=pos.multiplier,
             lot_size=pos.lot_size, lots=pos.lots, lots_before=pos.lots, price=price, sl=pos.sl,
-            reason="ENTRY", signal_ref=pos.signal_ref,
+            reason="ENTRY" if pos.buy_pct >= 100 else f"{pos.buy_pct:g}%",
+            signal_ref=pos.signal_ref,
             exact=pos.mode == "ONLY",
             entry=pos.mode or "CMP",
             sl_default="default" in (pos.sl_note or "").lower(),
+            buy_pct=pos.buy_pct,
         ))
         self._notify_opened(pos, reply_to)
         return ""
@@ -566,6 +571,7 @@ class PaperTrader:
             pos.mode = call.mode
             pos.level = call.level
             pos.level_high = float(call.level_high or 0)
+            pos.buy_pct = float(call.buy_pct or 100)
             if call.book_level:
                 pos.book_level = float(call.book_level)
                 pos.book_pct = float(call.book_pct or 100)
@@ -695,6 +701,7 @@ class PaperTrader:
             with self.lock:
                 pos.mode, pos.level = call.mode, call.level
                 pos.level_high = float(call.level_high or 0)
+                pos.buy_pct = float(call.buy_pct or 100)
                 pos.book_level = float(call.book_level or 0)
                 pos.book_pct = float(call.book_pct or 0) if call.book_level else 0.0
                 pos.sl, pos.no_sl = call.sl, call.no_sl

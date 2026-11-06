@@ -21,6 +21,8 @@ Sl 80                  Sl 70                  Sl 70
 
 `Sl` is optional. A target line is ignored.
 
+`Buy 25%` and `Buy 50%` sit in front of the same entry: `Buy 25% CMP`, `Buy 50% Above 100`, `Buy 25% Near 90`, `Buy 25% only 100`. The percent is of each account's full size, rounded down, and at least one lot when the account can afford one. A one-lot signal book still records the call. A plain `Buy CMP` is the full size. Any other percent is refused.
+
 ## Tag a watchlist line to buy it
 
 The option can sit on its own message. Reply on that message with the entry:

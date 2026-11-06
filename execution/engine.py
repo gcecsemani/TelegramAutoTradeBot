@@ -32,7 +32,7 @@ from core.crypto import decrypt
 from core.logging_setup import get
 from execution import store
 from execution.events import CopyEvent
-from execution.risk import lots_for_balance, plan_buy, round_tick, sell_lots
+from execution.risk import lots_for_balance, plan_buy, portion_lots, round_tick, sell_lots
 
 log = get("copy")
 
@@ -220,7 +220,7 @@ class CopyEngine:
                 reason = f"could not read the account balance ({exc})"
             else:
                 per = store.rupees_per_lot(event.symbol)
-                sized = lots_for_balance(balance, per)
+                sized = portion_lots(lots_for_balance(balance, per), event.buy_pct)
                 if sized < 1:
                     reason = f"balance {_inr(balance)} is below {_inr(per)} for 1 {event.symbol or 'symbol'} lot"
                 else:
@@ -1172,6 +1172,7 @@ def _event_from_position(pos, action: str, lots: int, lots_before: int, reason: 
         exact=getattr(pos, "mode", "") == "ONLY",
         entry=getattr(pos, "mode", "") or "CMP",
         sl_default="default" in (getattr(pos, "sl_note", "") or "").lower(),
+        buy_pct=float(getattr(pos, "buy_pct", 100) or 100),
     )
 
 

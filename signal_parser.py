@@ -11,6 +11,9 @@ BUY CALL (its own message)
     Buy Near 100-105   buy at 105 or below (inside the range, or under it)
     Buy only 100       buy only when the ask is 100, with no band
     Buy CMP            buy at the current price
+    Buy 25% CMP        same entries, for 25% of each account's full size
+    Buy 50% Above 100  50% of that size. Also Near, CMP, and only
+    Buy 25% only 100   exact price, no slippage, on that slice
     Book near 130      once open, sell everything at 130 or above
     Book 50 near 130   once open, sell 50% at 130 or above
     Sl 80              optional
@@ -59,21 +62,30 @@ CONTRACT_RE = re.compile(r"(?<![\d.])(" + NUM + r")\s*-?\s*(CE|PE|CALL|PUT)\b")
 WORD_RE = re.compile(r"[A-Z0-9&\-]+")
 
 BUY_WORD_RE = re.compile(r"\bBUY\b")
+_PORTION = r"(?:(25|50)\s*%\s*)?"
+_ANY_PORTION_RE = re.compile(r"\bBUY\s*[:\-@]?\s*(" + NUM + r")\s*%")
+_ENTRY_HINT = (
+    "Write the entry as Buy Above 100, Buy Near 90, Buy Near 100-105, Buy only 100 or Buy CMP. "
+    "A split is Buy 25% or Buy 50% in front of the same entry, including Buy 25% only 100."
+)
 BUY_RANGE_RE = re.compile(
-    r"\bBUY\s*[:\-@]?\s*NEAR\s*[:\-@]?\s*(" + NUM + r")\s*-\s*(" + NUM + r")" + _END
+    r"\bBUY\s*[:\-@]?\s*" + _PORTION + r"NEAR\s*[:\-@]?\s*(" + NUM + r")\s*-\s*(" + NUM + r")" + _END
 )
 BUY_ONLY_RE = re.compile(
-    r"\bBUY\s*[:\-@]?\s*(?:"
+    r"\bBUY\s*[:\-@]?\s*" + _PORTION + r"(?:"
     r"ONLY\s*[:\-@]?\s*(" + NUM + r")" + _END +
-    r"|(" + NUM + r")\s*ONLY\b"
+    r"|[:\-@]?\s*(" + NUM + r")\s*ONLY\b"
     r")"
 )
-BUY_RE = re.compile(r"\bBUY\s*[:\-@]?\s*(?:(ABOVE|NEAR)\s*[:\-@]?\s*(" + NUM + r")" + _END + r"|(CMP)\b)")
+BUY_RE = re.compile(
+    r"\bBUY\s*[:\-@]?\s*" + _PORTION +
+    r"(?:(ABOVE|NEAR)\s*[:\-@]?\s*(" + NUM + r")" + _END + r"|(CMP)\b)"
+)
 BOOK_AT_RE = re.compile(
     r"\bBOOK\s*(?:(" + NUM + r")\s*%?\s+)?NEAR\s*[:\-@]?\s*(" + NUM + r")" + _END
 )
 _INCOMPLETE_ENTRY_RE = re.compile(
-    r"\bBUY\s*[:\-@]?\s*(?:ABOVE|NEAR)\b(?!\s*[:\-@]?\s*" + NUM + _END + r")"
+    r"\bBUY\s*[:\-@]?\s*(?:(?:25|50)\s*%\s*)?(?:ABOVE|NEAR|ONLY)\b(?!\s*[:\-@]?\s*" + NUM + _END + r")"
 )
 _BARE_BUY_PRICE_RE = re.compile(r"\bBUY\s*[:\-@]?\s*" + NUM + _END)
 SELL_RE = re.compile(r"\b(?:SELL|SHORT|WRITE)\b")
@@ -114,6 +126,7 @@ class BuyCall:
     level_high: Optional[float] = None   # top of "Buy Near 100-105"; buy at or below this
     book_level: Optional[float] = None   # sell when the premium reaches this
     book_pct: float = 100.0              # 100 = all, 50 = half, used with book_level
+    buy_pct: float = 100.0               # 100, 50, or 25. Slice of each account's full size
     sl: Optional[float] = None
     no_sl: bool = False
     targets: List[float] = field(default_factory=list)
@@ -138,13 +151,14 @@ class BuyCall:
         return "\n".join(lines)
 
     def entry_line(self) -> str:
+        share = "" if self.buy_pct >= 100 else f"{self.buy_pct:g}% "
         if self.mode == "CMP":
-            return "Buy CMP"
+            return f"Buy {share}CMP"
         if self.mode == "ONLY":
-            return f"Buy only {self.level:g}"
+            return f"Buy {share}only {self.level:g}"
         if self.mode == "RANGE":
-            return f"Buy Near {self.level:g}-{self.level_high:g}"
-        return f"Buy {self.mode.title()} {self.level:g}"
+            return f"Buy {share}Near {self.level:g}-{self.level_high:g}"
+        return f"Buy {share}{self.mode.title()} {self.level:g}"
 
 
 @dataclass
@@ -224,43 +238,51 @@ def parse_call(t: str) -> Tuple[Optional[BuyCall], str]:
     if found is None:
         if re.search(r"\bBUY\s*\.\s*" + NUM, t):
             return None, ""
-        return None, "Write the entry as Buy Above 100, Buy Near 90, Buy Near 100-105, Buy only 100 or Buy CMP."
-    mode, level, level_high, buy = found
+        return None, _ENTRY_HINT
+    mode, level, level_high, buy, portion = found
     call = BuyCall(symbol=symbol, strike=float(contract.group(1)),
                    opt_type="CE" if contract.group(2).startswith("C") else "PE",
-                   mode=mode, level=level, level_high=level_high)
+                   mode=mode, level=level, level_high=level_high, buy_pct=portion)
     _apply_sl_targets(call, t[:buy.start()] + " " + t[buy.end():])
     _apply_book(call, t)
     return call, ""
 
 
+def _portion_of(match, group: int = 1) -> float:
+    raw = match.group(group) if match else None
+    return float(raw) if raw else 100.0
+
+
 def _read_entry(t: str):
-    """(mode, level, level_high, match) or (None, error). An empty error means no entry."""
+    """(mode, level, level_high, match, percent) or (None, error). An empty error means no entry."""
+    stated = _ANY_PORTION_RE.search(t)
+    if stated and float(stated.group(1)) not in (25.0, 50.0):
+        return None, "A split buy is 25% or 50%. For example Buy 25% CMP, Buy 50% Above 100, or Buy 25% only 100."
     rng = BUY_RANGE_RE.search(t)
     if rng:
-        low, high = float(rng.group(1)), float(rng.group(2))
+        low, high = float(rng.group(2)), float(rng.group(3))
         if low <= 0 or high <= 0:
             return None, "The buy level must be above 0."
         if low > high:
             low, high = high, low
         if low == high:
-            return ("ONLY", low, None, rng), ""
-        return ("RANGE", low, high, rng), ""
+            return ("ONLY", low, None, rng, _portion_of(rng)), ""
+        return ("RANGE", low, high, rng, _portion_of(rng)), ""
     only = BUY_ONLY_RE.search(t)
     if only:
-        level = float(only.group(1) or only.group(2))
+        level = float(only.group(2) or only.group(3))
         if level <= 0:
             return None, "The buy level must be above 0."
-        return ("ONLY", level, None, only), ""
+        return ("ONLY", level, None, only, _portion_of(only)), ""
     buy = BUY_RE.search(t)
     if buy is None:
         if _INCOMPLETE_ENTRY_RE.search(t) or _BARE_BUY_PRICE_RE.search(t) or re.search(r"\bBUY\s*[:\-@]?\s*ONLY\b", t):
-            return None, "Write the entry as Buy Above 100, Buy Near 90, Buy Near 100-105, Buy only 100 or Buy CMP."
+            return None, _ENTRY_HINT
         return None, ""
-    level = float(buy.group(2)) if buy.group(2) else None
+    level = float(buy.group(3)) if buy.group(3) else None
     if level is not None and level <= 0:
         return None, "The buy level must be above 0."
-    return (buy.group(1) or "CMP", level, None, buy), ""
+    return (buy.group(2) or "CMP", level, None, buy, _portion_of(buy)), ""
 
 
 def _apply_book(call: BuyCall, text: str) -> None:
@@ -304,13 +326,14 @@ def parse_tagged_buy(reply: str, tagged: str) -> Tuple[Optional[BuyCall], str]:
         return None, error
     if found is None:
         return None, ""
-    mode, level, level_high, buy = found
+    mode, level, level_high, buy, portion = found
     call, error = _contract_from(tagged)
     if call is None:
         return None, error
     call.mode = mode
     call.level = level
     call.level_high = level_high
+    call.buy_pct = portion
     _apply_sl_targets(call, reply[:buy.start()] + " " + reply[buy.end():])
     _apply_book(call, reply)
     return call, ""

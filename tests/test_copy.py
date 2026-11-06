@@ -16,7 +16,7 @@ from execution import store                 # noqa: E402
 from execution import engine as copy_engine  # noqa: E402
 from execution.engine import CopyEngine     # noqa: E402
 from execution.events import CopyEvent      # noqa: E402
-from execution.risk import buy_limit, lots_for_balance, order_quantity, plan_buy, sell_lots  # noqa: E402
+from execution.risk import buy_limit, lots_for_balance, order_quantity, plan_buy, portion_lots, sell_lots  # noqa: E402
 
 
 def _event(**overrides) -> CopyEvent:
@@ -62,6 +62,17 @@ class RiskTests(unittest.TestCase):
             max_loss_trade=None, max_loss_day=1000, day_realized=-1000, default_sl_pct=30,
         )
         self.assertFalse(plan.ok)
+
+    def test_a_split_is_part_of_the_full_size_and_at_least_one_lot(self):
+        self.assertEqual(portion_lots(4, 25), 1)
+        self.assertEqual(portion_lots(4, 50), 2)
+        self.assertEqual(portion_lots(8, 25), 2)
+        self.assertEqual(portion_lots(2, 25), 1)
+        self.assertEqual(portion_lots(2, 50), 1)
+        self.assertEqual(portion_lots(1, 25), 1)
+        self.assertEqual(portion_lots(3, 50), 1)
+        self.assertEqual(portion_lots(4, 100), 4)
+        self.assertEqual(portion_lots(0, 25), 0)
 
     def test_balance_sets_lots_without_looking_at_open_positions(self):
         self.assertEqual(lots_for_balance(50000, 50000), 1)
@@ -487,6 +498,21 @@ class FanoutTests(unittest.TestCase):
         self.assertEqual(leg["sl_status"], "WORKING")
         self.assertEqual(leg["sl_trigger"], 80)
         self.assertEqual(broker.orders[1].quantity, 65)
+
+    def test_a_split_buy_uses_part_of_the_account_and_only_stays_exact(self):
+        store.update_account(self.one, self.user, {"paper_balance": 200000})
+        self.engine.handle(_event(position_id="quarter", buy_pct=25))
+        quarter = store.buy_intent(self.one, "quarter")
+        self.assertEqual(quarter["lots"], 1)
+        self.assertEqual(quarter["quantity"], 65)
+        self.engine.handle(_event(position_id="half", buy_pct=50, entry="ABOVE"))
+        half = store.buy_intent(self.one, "half")
+        self.assertEqual(half["lots"], 2)
+        self.assertEqual(half["order_type"], "LIMIT")
+        self.engine.handle(_event(position_id="exact-slice", buy_pct=25, exact=True, entry="ONLY", price=100))
+        exact = store.buy_intent(self.one, "exact-slice")
+        self.assertEqual(exact["lots"], 1)
+        self.assertEqual(exact["limit_price"], 100.0)
 
     def test_an_exact_price_buy_does_not_add_slippage(self):
         self.engine.handle(_event(position_id="pos-exact", price=100, exact=True))
