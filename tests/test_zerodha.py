@@ -7,6 +7,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from brokers.base import BrokerError, OrderRequest  # noqa: E402
+from brokers import zerodha as zerodha_mod  # noqa: E402
 from brokers.zerodha import ZerodhaBroker, stop_limit_price  # noqa: E402
 
 
@@ -28,14 +29,26 @@ class _Kite:
         self.rows = []
         self.fail_positions = False
         self.block_slm = False
+        self.position_reads = 0
+        self._empty_reads = 0
+        self.modifies = []
+        self.history = None
 
     def set_access_token(self, token):
         return None
 
     def positions(self):
+        self.position_reads += 1
         if self.fail_positions:
             raise RuntimeError("positions down")
+        if self._empty_reads:
+            self._empty_reads -= 1
+            return {"net": []}
         return {"net": list(self.rows)}
+
+    def modify_order(self, **kwargs):
+        self.modifies.append(kwargs)
+        return kwargs["order_id"]
 
     def place_order(self, **kwargs):
         self.calls.append(kwargs)
@@ -44,6 +57,8 @@ class _Kite:
         return "1"
 
     def order_history(self, order_id):
+        if self.history is not None:
+            return self.history
         if order_id == "rejected":
             return [{
                 "order_id": order_id, "status": "REJECTED", "average_price": 0,
@@ -69,6 +84,7 @@ def _order(**overrides) -> OrderRequest:
 
 class ZerodhaOrderTests(unittest.TestCase):
     def setUp(self):
+        zerodha_mod._POSITION_PAUSE = 0
         self.broker = ZerodhaBroker("key", "secret", "token")
         self.kite = _Kite()
         self.broker.kite = self.kite
@@ -128,6 +144,26 @@ class ZerodhaOrderTests(unittest.TestCase):
         self.assertEqual(self.kite.calls[1]["price"], stop_limit_price(80))
         self.assertLess(self.kite.calls[1]["price"], 80)
         self.assertEqual(view.status, "OPEN")
+
+    def test_a_stop_waits_until_the_new_long_shows_in_positions(self):
+        self.kite._empty_reads = 2
+        self.kite.rows = [{"exchange": "NFO", "tradingsymbol": "NIFTY26N0322800PE",
+                           "quantity": 65, "product": "MIS"}]
+        self.broker.place(_order(order_type="SL-M", trigger_price=70, quantity=65))
+        self.assertEqual(self.kite.position_reads, 3)
+        self.assertEqual(len(self.kite.calls), 1)
+        self.assertEqual(self.kite.calls[0]["quantity"], 65)
+
+    def test_moving_a_stop_limit_keeps_the_limit_under_the_trigger(self):
+        self.kite.history = [{
+            "order_id": "SL1", "status": "TRIGGER PENDING", "order_type": "SL",
+            "average_price": 0, "filled_quantity": 0, "status_message": "",
+        }]
+        self.broker.modify("SL1", 70, 65)
+        sent = self.kite.modifies[0]
+        self.assertEqual(sent["order_type"], "SL")
+        self.assertEqual(sent["trigger_price"], 70)
+        self.assertLess(sent["price"], 70)
 
 
 if __name__ == "__main__":

@@ -263,6 +263,8 @@ class CopyEngine:
                           order_type, entry_reason)
         if event.sl_default:
             row["stop_trigger"] = 0.0
+        if _zerodha_live(account) and (event.exchange or "").upper() == "MCX":
+            row["product"] = "NRML"
         if not store.claim_intent(row):
             return Result(name, "DONE", "already handled", notify=False)
         intent = store.intent_by_key(key)
@@ -307,6 +309,13 @@ class CopyEngine:
         name = self._name(account)
         leg = store.get_leg(account["id"], event.position_id)
         buy = store.buy_intent(account["id"], event.position_id)
+        if buy and buy["status"] in ("WORKING", "UNKNOWN", "SENDING"):
+            self._finish_open_buy(account, buy)
+            buy = store.buy_intent(account["id"], event.position_id)
+            leg = store.get_leg(account["id"], event.position_id)
+        if buy and buy["status"] in ("WORKING", "SENDING", "UNKNOWN"):
+            self._defer_exit(account, event, "buy")
+            return Result(name, "WAITING", "the buy is still working, so the exit was not sent")
         if (leg is None or int(leg["lots_open"]) <= 0) and buy and buy["status"] in _OPEN:
             key = f"{event.position_id}:{account['id']}:SELL:WAIT"
             row = _intent_row(key, account, event, "SELL", event.lots, 0, 0.0, "MARKET", event.reason)
@@ -345,15 +354,19 @@ class CopyEngine:
 
     def _defer_exit(self, account: dict, event: CopyEvent, pulled: str) -> None:
         """Remember an exit the stop blocked, so recovery keeps trying it."""
-        reason = "STOP UNCONFIRMED" if pulled == "unknown" else "STOP WORKING"
+        if pulled == "unknown":
+            reason, text = "STOP UNCONFIRMED", "The stop is not confirmed yet, so no market sell was sent. I will keep trying."
+        elif pulled == "buy":
+            reason, text = "BUY WORKING", "The buy is still working, so no market sell was sent. I will keep trying."
+        else:
+            reason, text = "STOP WORKING", "The stop is still working, so no second sell was sent. I will keep trying."
         key = f"{event.position_id}:{account['id']}:SELL:WAIT"
         row = _intent_row(key, account, event, "SELL", event.lots, 0, 0.0, "MARKET", reason)
         row["status"] = "WAITING"
         if store.claim_intent(row):
             self._announce(
                 account,
-                f"⏳ Exit waiting · {_esc(self._name(account))} · {_esc(event.tradingsymbol)}\n"
-                "The stop is not confirmed yet, so no market sell was sent. I will keep trying.",
+                f"⏳ Exit waiting · {_esc(self._name(account))} · {_esc(event.tradingsymbol)}\n{text}",
             )
             return
         existing = store.intent_by_key(key)
@@ -393,7 +406,8 @@ class CopyEngine:
             return Result(name, "UNKNOWN", "sent, confirmation pending")
         return self._apply(account, intent, view, side)
 
-    def _apply(self, account: dict, intent: dict, view: OrderView, side: str) -> Result:
+    def _apply(self, account: dict, intent: dict, view: OrderView, side: str,
+               arm_stop: bool = True) -> Result:
         name = self._name(account)
         fields = {
             "broker_order_id": view.order_id,
@@ -418,42 +432,44 @@ class CopyEngine:
                 intent.get("tag") or "", "UNKNOWN",
             )
             return Result(name, "UNKNOWN", "stop placed; status not confirmed", notify=False)
-        if view.filled_quantity > 0 and view.status in ("COMPLETE", "CANCELLED"):
+        filled = int(view.filled_quantity or 0)
+        terminal = view.status in ("COMPLETE", "CANCELLED")
+        if filled > 0 and (terminal or (side == "BUY" and view.status == "OPEN")):
             price = view.average_price or float(intent["limit_price"] or 0)
             if price <= 0 and side == "SELL":
                 leg = store.get_leg(account["id"], intent["position_id"])
                 price = float(leg["avg_entry"]) if leg else 0.0
-            if price <= 0:
+            already = int(intent.get("filled_qty") or 0)
+            new_qty = max(0, filled - already)
+            if price <= 0 and new_qty > 0:
                 store.update_intent(intent["id"], status="UNKNOWN", last_error="no fill price", **fields)
                 return Result(name, "UNKNOWN", "no fill price")
-            per = max(1, int(intent["quantity"]) // max(1, int(intent["lots"] or 1)))
-            lots = max(1, view.filled_quantity // per) if per else int(intent["lots"])
-            lots = min(lots, int(intent["lots"] or lots))
-            pnl = store.apply_fill(
-                account["id"], intent["position_id"], side=side, lots=lots,
-                quantity=view.filled_quantity, price=price, multiplier=int(intent["multiplier"] or 1),
-                tradingsymbol=intent["tradingsymbol"], exchange=intent["exchange"],
-                product=intent["product"],
-            )
+            pnl = 0.0
+            lots = 0
+            if new_qty > 0:
+                lots = _lots_for_fill(intent, already, new_qty)
+                pnl = store.apply_fill(
+                    account["id"], intent["position_id"], side=side, lots=lots,
+                    quantity=new_qty, price=price, multiplier=int(intent["multiplier"] or 1),
+                    tradingsymbol=intent["tradingsymbol"], exchange=intent["exchange"],
+                    product=intent["product"],
+                )
+                self._check_day_loss(account)
+            if not terminal:
+                store.update_intent(intent["id"], status="WORKING", reason=intent.get("reason") or side, **fields)
+                detail = f"{lots} lots @ {price:,.2f} · rest of the limit is still working"
+                if side == "BUY" and arm_stop and new_qty > 0:
+                    detail, sold = self._guard_buy(account, intent, price, detail, view)
+                    if sold:
+                        return Result(name, "FILLED", detail)
+                return Result(name, "WORKING", detail)
             store.update_intent(intent["id"], status="FILLED", reason=intent.get("reason") or side, **fields)
-            self._check_day_loss(account)
-            detail = f"{lots} lots @ {price:,.2f}"
+            detail = f"{lots or int(intent.get('lots') or 0)} lots @ {price:,.2f}"
             if side == "SELL":
                 detail += f" · pnl {pnl:,.0f}"
                 self._rearm_open(account, intent["position_id"])
-            if side == "BUY":
-                trigger = _stop_after_fill(intent, price)
-                if trigger > 0 and trigger < price:
-                    store.update_intent(intent["id"], stop_trigger=trigger)
-                    intent = store.intent_by_id(intent["id"]) or intent
-                    self._arm_stop(account, intent, trigger, view.filled_quantity)
-                    fresh = store.get_leg(account["id"], intent["position_id"]) or {}
-                    if fresh.get("sl_status") == "WORKING":
-                        detail += f" · stop {float(fresh['sl_trigger']):,.2f}"
-                    elif fresh.get("sl_status") == "FAILED":
-                        detail += " · stop was rejected"
-                elif trigger >= price and trigger > 0:
-                    detail += " · stop not placed, it is not below the fill"
+            if side == "BUY" and arm_stop:
+                detail, _sold = self._guard_buy(account, intent, price, detail, view)
             return Result(name, "FILLED", detail)
         if view.status == "REJECTED" or (view.status == "CANCELLED" and view.filled_quantity <= 0):
             status = "MISSED" if side == "BUY" and view.status == "CANCELLED" else "REJECTED"
@@ -474,6 +490,110 @@ class CopyEngine:
             return Result(name, "WORKING", "order is working")
         store.update_intent(intent["id"], status="UNKNOWN", **fields)
         return Result(name, "UNKNOWN", view.message or "status not confirmed")
+
+    def _guard_buy(self, account: dict, intent: dict, price: float, detail: str, view: OrderView):
+        """Arm the stop under the fill. A fill already through the SL is sold."""
+        trigger = _stop_after_fill(intent, price)
+        default = "DEFAULT-SL" in (intent.get("reason") or "")
+        if trigger > 0 and trigger < price:
+            store.update_intent(intent["id"], stop_trigger=trigger)
+            fresh_intent = store.intent_by_id(intent["id"]) or intent
+            self._protect(account, fresh_intent, trigger)
+            fresh = store.get_leg(account["id"], intent["position_id"]) or {}
+            if fresh.get("sl_status") == "WORKING":
+                detail += f" · stop {float(fresh['sl_trigger']):,.2f}"
+            elif fresh.get("sl_status") == "FAILED":
+                detail += " · stop was rejected"
+            return detail, False
+        if trigger >= price and trigger > 0 and not default:
+            sold = self._sell_open_leg(account, intent, price, trigger)
+            detail += f" · sold, the fill is already at or below the SL ({sold.status})"
+            return detail, True
+        return detail, False
+
+    def _sell_open_leg(self, account: dict, intent: dict, price: float, trigger: float) -> Result:
+        leg = store.get_leg(account["id"], intent["position_id"])
+        if leg is None or int(leg["lots_open"]) <= 0:
+            return Result(self._name(account), "SKIPPED", "nothing open")
+        return self._sell(account, CopyEvent(
+            action="SELL", position_id=intent["position_id"], symbol=intent.get("symbol") or "",
+            exchange=leg["exchange"], tradingsymbol=leg["tradingsymbol"],
+            tick_size=float(intent.get("tick") or 0.05), multiplier=int(leg["multiplier"] or 1),
+            lot_size=0, lots=int(leg["lots_open"]), lots_before=int(leg["lots_open"]),
+            price=price, sl=trigger, reason="SL ALREADY HIT", signal_ref="",
+        ))
+
+    def _protect(self, account: dict, intent: dict, trigger: float) -> None:
+        """Cover the whole long. A later slice of the same buy grows the stop."""
+        leg = store.get_leg(account["id"], intent["position_id"])
+        if leg is None or int(leg["lots_open"]) <= 0:
+            return
+        held = int(leg["quantity_open"])
+        if leg.get("sl_status") == "WORKING" and leg.get("sl_order_id"):
+            if int(leg.get("sl_quantity") or 0) >= held:
+                return
+            broker = self.broker_factory(account)
+            if not hasattr(broker, "modify"):
+                return
+            try:
+                broker.modify(leg["sl_order_id"], float(leg.get("sl_trigger") or trigger), held)
+            except (BrokerError, TransientError, TokenError):
+                return
+            store.set_leg_stop(
+                account["id"], intent["position_id"], leg["sl_order_id"],
+                float(leg.get("sl_trigger") or trigger), held, leg.get("sl_tag") or "", "WORKING",
+            )
+            return
+        self._arm_stop(account, intent, trigger, held)
+
+    def _finish_open_buy(self, account: dict, buy: dict) -> None:
+        """An exit arrived while the buy was still resting. Cancel it, or book a fill."""
+        if buy.get("status") not in ("WORKING", "UNKNOWN", "SENDING"):
+            return
+        broker = self.broker_factory(account)
+        view = None
+        try:
+            if buy.get("broker_order_id") and hasattr(broker, "fetch"):
+                view = broker.fetch(buy["broker_order_id"])
+            if (view is None or view.status == "UNKNOWN") and buy.get("tag") and hasattr(broker, "find_by_tag"):
+                found = broker.find_by_tag(buy["tag"])
+                if found is not None:
+                    view = found
+        except (TokenError, TransientError, BrokerError):
+            return
+        if view is None or view.status == "UNKNOWN":
+            return
+        if view.status == "OPEN":
+            cancelled = self._cancel_order(account, view.order_id)
+            if cancelled is None:
+                return
+            view = cancelled
+        if view.filled_quantity > 0 and view.status in ("COMPLETE", "CANCELLED"):
+            self._apply(account, buy, view, "BUY", arm_stop=False)
+            return
+        if view.status in ("CANCELLED", "REJECTED"):
+            store.update_intent(
+                buy["id"], status="CANCELLED" if view.status == "CANCELLED" else "REJECTED",
+                reason="cancelled before the exit",
+                broker_order_id=view.order_id or buy.get("broker_order_id") or "",
+            )
+
+    def _cancel_order(self, account: dict, order_id: str):
+        if not order_id:
+            return None
+        broker = self.broker_factory(account)
+        if not hasattr(broker, "cancel"):
+            return None
+        try:
+            view = broker.cancel(order_id)
+        except BrokerError:
+            try:
+                return broker.fetch(order_id) if hasattr(broker, "fetch") else None
+            except (TokenError, TransientError, BrokerError):
+                return None
+        except (TokenError, TransientError):
+            return None
+        return view
 
     def _update_stop(self, account: dict, event: CopyEvent) -> Result:
         name = self._name(account)
@@ -779,6 +899,10 @@ class CopyEngine:
                 return
             buy = store.buy_intent(account["id"], intent["position_id"])
             leg = store.get_leg(account["id"], intent["position_id"])
+            if buy and buy["status"] in ("WORKING", "UNKNOWN", "SENDING"):
+                self._finish_open_buy(account, buy)
+                buy = store.buy_intent(account["id"], intent["position_id"])
+                leg = store.get_leg(account["id"], intent["position_id"])
             if buy and buy["status"] in _OPEN:
                 return
             if buy and buy["status"] in _TERMINAL_BUY_FAIL:
@@ -1059,8 +1183,25 @@ def _stop_after_fill(intent: dict, price: float) -> float:
     """A call with no SL gets 30% under the price this account actually paid."""
     tick = float(intent.get("tick") or 0.05) or 0.05
     if "DEFAULT-SL" in (intent.get("reason") or ""):
-        return round_tick(price * (1 - float(config.TRADE["default_sl_pct"]) / 100.0), tick)
+        trigger = round_tick(price * (1 - float(config.TRADE["default_sl_pct"]) / 100.0), tick)
+        if trigger >= price:
+            trigger = round_tick(price - tick, tick)
+        return trigger
     return round_tick(float(intent.get("stop_trigger") or 0), tick)
+
+
+def _lots_for_fill(intent: dict, already: int, new_qty: int) -> int:
+    """Lots represented by a new slice of the fill, never more than the order."""
+    ordered = max(1, int(intent.get("lots") or 1))
+    per = max(1, int(intent.get("quantity") or new_qty) // ordered)
+    booked = already // per
+    room = max(0, ordered - booked)
+    if room <= 0 or new_qty <= 0:
+        return 0
+    lots = new_qty // per
+    if lots < 1:
+        lots = 1
+    return min(room, lots)
 
 
 def _inr(amount: float) -> str:

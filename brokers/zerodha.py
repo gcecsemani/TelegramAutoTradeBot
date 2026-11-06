@@ -18,6 +18,8 @@ from kiteconnect import exceptions as kite_exc
 from brokers.base import BrokerError, OrderRequest, OrderView, TokenError, TransientError
 from data.rate_limiter import TokenBucket
 
+_POSITION_PAUSE = 0.4
+
 _STATUS = {
     "COMPLETE": "COMPLETE",
     "REJECTED": "REJECTED",
@@ -135,48 +137,54 @@ class ZerodhaBroker:
         return self._await(str(order_id))
 
     def _open_long(self, exchange: str, tradingsymbol: str, product: str) -> tuple:
-        """Bought quantity for this contract. A failed read does not sell."""
-        self._pace()
-        try:
-            payload = self.kite.positions() or {}
-        except kite_exc.TokenException as exc:
-            raise TokenError(str(exc)) from exc
-        except Exception as exc:
-            raise BrokerError(
-                f"Zerodha positions could not be read, so the sell was not sent. {exc}"
-            ) from exc
-        wanted = (exchange or "").upper()
+        """Bought quantity for this contract. A failed read does not sell.
+
+        The position book can lag a fill by a moment, so a stop placed straight
+        after a buy looks a few times before it gives up.
+        """
         symbol = tradingsymbol or ""
-        found = []
-        for row in payload.get("net") or []:
-            if str(row.get("exchange") or "").upper() != wanted:
+        last_error = None
+        for attempt in range(3):
+            if attempt:
+                time.sleep(_POSITION_PAUSE)
+            self._pace()
+            try:
+                payload = self.kite.positions() or {}
+            except kite_exc.TokenException as exc:
+                raise TokenError(str(exc)) from exc
+            except Exception as exc:
+                last_error = exc
                 continue
-            if str(row.get("tradingsymbol") or "") != symbol:
-                continue
-            qty = int(row.get("quantity") or 0)
-            if qty <= 0:
-                continue
-            found.append((str(row.get("product") or "").upper(), qty))
-        if not found:
-            raise BrokerError(f"No bought {symbol} at Zerodha, so the sell was not sent.")
-        for held, qty in found:
-            if held == (product or "").upper() and held in ("MIS", "NRML"):
-                return held, qty
-        held, qty = max(found, key=lambda item: item[1])
-        if held in ("MIS", "NRML"):
-            return held, qty
-        return product or "NRML", qty
+            found = _long_rows(payload, exchange, symbol)
+            if found:
+                return _pick_long(found, product)
+        if last_error is not None:
+            raise BrokerError(
+                f"Zerodha positions could not be read, so the sell was not sent. {last_error}"
+            )
+        raise BrokerError(f"No bought {symbol} at Zerodha, so the sell was not sent.")
 
     def modify(self, order_id: str, trigger_price: float, quantity: int) -> OrderView:
+        """Move a working stop. A stop-limit keeps a limit under the new trigger."""
+        kind = "SL-M"
+        try:
+            rows = self._history(order_id)
+            kind = str((rows[-1] if rows else {}).get("order_type") or "SL-M").upper()
+        except (TokenError, TransientError, BrokerError):
+            kind = "SL-M"
+        order_type = self.kite.ORDER_TYPE_SL if kind == "SL" else self.kite.ORDER_TYPE_SLM
+        params = {
+            "variety": self.kite.VARIETY_REGULAR,
+            "order_id": order_id,
+            "quantity": int(quantity),
+            "trigger_price": float(trigger_price),
+            "order_type": order_type,
+        }
+        if order_type == self.kite.ORDER_TYPE_SL:
+            params["price"] = stop_limit_price(float(trigger_price))
         self._pace()
         try:
-            self.kite.modify_order(
-                variety=self.kite.VARIETY_REGULAR,
-                order_id=order_id,
-                quantity=int(quantity),
-                trigger_price=float(trigger_price),
-                order_type=self.kite.ORDER_TYPE_SLM,
-            )
+            self.kite.modify_order(**params)
         except kite_exc.TokenException as exc:
             raise TokenError(str(exc)) from exc
         except kite_exc.InputException as exc:
@@ -201,16 +209,19 @@ class ZerodhaBroker:
             return OrderView(str(order_id), "CANCELLED", 0.0, 0, "cancel sent")
 
     def fetch(self, order_id: str) -> OrderView:
+        rows = self._history(order_id)
+        if not rows:
+            return OrderView(order_id, "UNKNOWN", 0.0, 0, "order history is empty")
+        return _view(rows[-1])
+
+    def _history(self, order_id: str) -> list:
         self._pace()
         try:
-            rows = self.kite.order_history(order_id) or []
+            return self.kite.order_history(order_id) or []
         except kite_exc.TokenException as exc:
             raise TokenError(str(exc)) from exc
         except Exception as exc:
             raise TransientError(str(exc)) from exc
-        if not rows:
-            return OrderView(order_id, "UNKNOWN", 0.0, 0, "order history is empty")
-        return _view(rows[-1])
 
     def find_by_tag(self, tag: str) -> OrderView | None:
         self._pace()
@@ -253,6 +264,31 @@ class ZerodhaBroker:
         wait = self._bucket.acquire()
         if wait > 0:
             time.sleep(wait)
+
+
+def _long_rows(payload: dict, exchange: str, symbol: str) -> list:
+    wanted = (exchange or "").upper()
+    found = []
+    for row in (payload or {}).get("net") or []:
+        if str(row.get("exchange") or "").upper() != wanted:
+            continue
+        if str(row.get("tradingsymbol") or "") != symbol:
+            continue
+        qty = int(row.get("quantity") or 0)
+        if qty <= 0:
+            continue
+        found.append((str(row.get("product") or "").upper(), qty))
+    return found
+
+
+def _pick_long(found: list, product: str) -> tuple:
+    for held, qty in found:
+        if held == (product or "").upper() and held in ("MIS", "NRML"):
+            return held, qty
+    held, qty = max(found, key=lambda item: item[1])
+    if held in ("MIS", "NRML"):
+        return held, qty
+    return product or "NRML", qty
 
 
 def order_validity(exchange: str, validity: str) -> str:

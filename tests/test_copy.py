@@ -376,9 +376,117 @@ class FanoutTests(unittest.TestCase):
         sells = [order for order in tape.orders if order.side == "SELL" and order.order_type == "MARKET"]
         self.assertEqual(len(sells), 1)
         self.assertEqual(sells[0].validity, "DAY")
+        before = len(tape.orders)
+        self.engine.handle(_event(
+            position_id="mcx-buy", entry="ABOVE", symbol="CRUDEOIL", exchange="MCX",
+            tradingsymbol="CRUDEOIL26NOV5200CE", lot_size=1, multiplier=100, price=100, sl=70,
+        ))
+        mcx = next(order for order in tape.orders[before:] if order.side == "BUY")
+        self.assertEqual(mcx.product, "NRML")
+        self.assertEqual(mcx.order_type, "LIMIT")
+        self.assertEqual(mcx.validity, "DAY")
         posted = "\n".join(self.notes)
         self.assertIn("Copy BUY", posted)
         self.assertNotIn("· paper", posted)
+
+    def test_an_exit_cancels_a_resting_limit_instead_of_selling_short(self):
+        class Resting:
+            def __init__(self):
+                self.orders = []
+                self.cancelled = []
+
+            def cash_balance(self, exchange):
+                return 200000
+
+            def place(self, order):
+                self.orders.append(order)
+                return OrderView("BUY1", "OPEN", 0, 0, "working")
+
+            def fetch(self, order_id):
+                return OrderView(order_id, "OPEN", 0, 0, "working")
+
+            def find_by_tag(self, tag):
+                return None
+
+            def cancel(self, order_id):
+                self.cancelled.append(order_id)
+                return OrderView(order_id, "CANCELLED", 0, 0, "cancelled")
+
+        config.LIVE_TRADING = True
+        store.update_account(self.one, self.user, {"mode": "live", "broker": "zerodha"})
+        store.set_token(self.one, "token", "AB1234")
+        resting = Resting()
+        self.engine.broker_factory = lambda account: resting
+        self.engine.handle(_event(position_id="rest", entry="ABOVE", price=100, sl=80))
+        self.assertEqual(store.buy_intent(self.one, "rest")["status"], "WORKING")
+        self.engine.handle(_event(
+            action="SELL", position_id="rest", lots=2, lots_before=2, price=100, reason="EXIT",
+        ))
+        self.assertEqual(resting.cancelled, ["BUY1"])
+        self.assertEqual(store.buy_intent(self.one, "rest")["status"], "CANCELLED")
+        self.assertIsNone(store.get_leg(self.one, "rest"))
+        self.assertTrue(all(order.side == "BUY" for order in resting.orders))
+
+    def test_a_fill_already_through_the_stop_is_sold(self):
+        class Through:
+            def __init__(self):
+                self.orders = []
+
+            def cash_balance(self, exchange):
+                return 200000
+
+            def place(self, order):
+                self.orders.append(order)
+                fill = 50 if order.side == "BUY" else 50
+                return OrderView("OID", "COMPLETE", fill, order.quantity, "filled")
+
+            def fetch(self, order_id):
+                return None
+
+            def find_by_tag(self, tag):
+                return None
+
+            def cancel(self, order_id):
+                return OrderView(order_id, "CANCELLED", 0, 0, "cancelled")
+
+        config.LIVE_TRADING = True
+        store.update_account(self.one, self.user, {"mode": "live", "broker": "zerodha"})
+        store.set_token(self.one, "token", "AB1234")
+        broker = Through()
+        self.engine.broker_factory = lambda account: broker
+        self.engine.handle(_event(position_id="through", entry="CMP", price=100, sl=80))
+        self.assertEqual([order.order_type for order in broker.orders], ["MARKET", "MARKET"])
+        self.assertEqual([order.side for order in broker.orders], ["BUY", "SELL"])
+        self.assertEqual(store.get_leg(self.one, "through")["lots_open"], 0)
+
+    def test_a_partial_fill_is_booked_and_the_rest_keeps_working(self):
+        class Partial:
+            def __init__(self):
+                self.orders = []
+
+            def cash_balance(self, exchange):
+                return 200000
+
+            def place(self, order):
+                self.orders.append(order)
+                if order.order_type == "SL-M":
+                    return OrderView("SL1", "OPEN", 0, 0, "stop")
+                return OrderView("BUY1", "OPEN", 100, 65, "partial")
+
+        config.LIVE_TRADING = True
+        store.update_account(self.one, self.user, {"mode": "live", "broker": "zerodha"})
+        store.set_token(self.one, "token", "AB1234")
+        broker = Partial()
+        self.engine.broker_factory = lambda account: broker
+        self.engine.handle(_event(position_id="part", entry="ABOVE", price=100, sl=80))
+        buy = store.buy_intent(self.one, "part")
+        leg = store.get_leg(self.one, "part")
+        self.assertEqual(buy["status"], "WORKING")
+        self.assertEqual(leg["lots_open"], 1)
+        self.assertEqual(leg["quantity_open"], 65)
+        self.assertEqual(leg["sl_status"], "WORKING")
+        self.assertEqual(leg["sl_trigger"], 80)
+        self.assertEqual(broker.orders[1].quantity, 65)
 
     def test_an_exact_price_buy_does_not_add_slippage(self):
         self.engine.handle(_event(position_id="pos-exact", price=100, exact=True))

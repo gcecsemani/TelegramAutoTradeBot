@@ -514,7 +514,7 @@ def buy_intent(account_id: int, position_id: str) -> Optional[dict]:
 def update_intent(intent_id: int, **fields) -> None:
     allowed = {
         "status", "reason", "broker_order_id", "avg_price", "filled_qty",
-        "attempts", "last_error", "lots", "quantity", "limit_price",
+        "attempts", "last_error", "lots", "quantity", "limit_price", "stop_trigger",
     }
     sets = ["updated_at = ?"]
     args: list = [clock.now().isoformat()]
