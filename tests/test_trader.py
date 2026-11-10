@@ -245,6 +245,9 @@ class EntryTests(Harness):
         self.assertIn("not listed", self.tg.last())
         self.post("NIFTY 22800PE\nBuy 100")
         self.assertIn("Buy Above 100, Buy Near 90, Buy Near 100-105, Buy only 100 or Buy CMP", self.tg.last())
+        self.post("CrudeoilM buy only 110")
+        self.assertIn("Not taken", self.tg.last())
+        self.assertIn("CRUDEOILM needs a strike", self.tg.last())
         self.msg_id += 1
         self.bot.handle_update({"update_id": 1, "message": {
             "message_id": self.msg_id, "date": clock.now().timestamp() - 900, "chat": {"id": int(SIGNAL)},

@@ -83,6 +83,17 @@ class BuyCallTests(unittest.TestCase):
             self.assertEqual(parsed.kind, "INVALID", text)
             self.assertIn(words, parsed.error, text)
 
+    def test_a_named_instrument_without_an_option_is_explained(self):
+        parsed = parse("CrudeoilM buy only 110")
+        self.assertEqual(parsed.kind, "INVALID")
+        self.assertIn("CRUDEOILM needs a strike", parsed.error)
+        self.assertIn("7650 PE", parsed.error)
+        parsed = parse("CrudeoilM 7650 buy only 110")
+        self.assertEqual(parsed.kind, "INVALID")
+        self.assertIn("CRUDEOILM 7650 needs CE, PE, call or put", parsed.error)
+        self.assertEqual(parse("Buy only 110", is_reply=True, tagged="CRUDEOILM 7650 PE").kind, "BUY")
+        self.assertEqual(parse("Buy only 110").kind, "NONE")
+
 
     def test_range_only_and_book_prices(self):
         parsed = parse("NIFTY 22800PE\nbuy above 100")

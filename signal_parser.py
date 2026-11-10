@@ -1,7 +1,8 @@
 """
 signal_parser.py
 ================
-Reads exactly these messages. Anything else is ignored.
+Reads exactly these messages. A buy that names an instrument but no option
+is refused with the reason. Anything else is ignored.
 
 BUY CALL (its own message)
 
@@ -221,10 +222,71 @@ def _symbol_before(text: str, start: int) -> Optional[str]:
     return None
 
 
+def _named_symbol(text: str) -> Optional[str]:
+    """The longest known instrument name anywhere in the message."""
+    words = list(WORD_RE.finditer(text))
+    for n in (3, 2, 1):
+        if len(words) < n:
+            continue
+        for i in range(len(words) - n + 1):
+            span = text[words[i].start():words[i + n - 1].end()]
+            found = _lookup_symbol(span)
+            if found:
+                return found
+    return None
+
+
+def _entry_numbers(text: str) -> set:
+    """Prices that belong to the buy line, so a leftover number can be the strike."""
+    used = set()
+    portion = _ANY_PORTION_RE.search(text)
+    if portion:
+        used.add(portion.group(1))
+    for pattern, groups in ((BUY_RANGE_RE, (2, 3)), (BUY_ONLY_RE, (2, 3)), (BUY_RE, (3,))):
+        match = pattern.search(text)
+        if not match:
+            continue
+        for group in groups:
+            if match.group(group):
+                used.add(match.group(group))
+    return used
+
+
+def _strike_hint(text: str) -> Optional[str]:
+    used = _entry_numbers(text)
+    for match in re.finditer(NUM, text):
+        if match.group(0) not in used:
+            return match.group(0)
+    return None
+
+
+def _attempted_buy(text: str) -> bool:
+    if re.search(r"\bFUT(?:URE)?S?\b", text):
+        return False
+    return bool(
+        BUY_RANGE_RE.search(text) or BUY_ONLY_RE.search(text) or BUY_RE.search(text)
+        or _INCOMPLETE_ENTRY_RE.search(text) or re.search(r"\bBUY\s*[:\-@]?\s*ONLY\b", text)
+    )
+
+
+def _missing_option_reason(text: str, symbol: str) -> str:
+    strike = _strike_hint(text)
+    if strike:
+        return (f"{symbol} {strike} needs CE, PE, call or put. "
+                f"Write {symbol} {strike} PE buy only 110.")
+    return (f"{symbol} needs a strike and CE, PE, call or put. "
+            f"Write {symbol} 7650 PE buy only 110.")
+
+
 def parse_call(t: str) -> Tuple[Optional[BuyCall], str]:
     """(call, "") · (None, reason) for a broken call · (None, "") for anything else."""
     contracts = list(CONTRACT_RE.finditer(t))
-    if not contracts or not BUY_WORD_RE.search(t):
+    if not BUY_WORD_RE.search(t):
+        return None, ""
+    if not contracts:
+        symbol = _named_symbol(t)
+        if symbol and _attempted_buy(t):
+            return None, _missing_option_reason(t, symbol)
         return None, ""
     if len(contracts) > 1 or SELL_RE.search(t):
         return None, "Only one option buy per call — no selling, spreads or hedges."
