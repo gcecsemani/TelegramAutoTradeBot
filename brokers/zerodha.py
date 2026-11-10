@@ -89,14 +89,33 @@ class ZerodhaBroker:
                 )
         elif (order.exchange or "").upper() == "MCX":
             product = "NRML"
-        view = self._submit(order, quantity, product, order.order_type, order.price)
-        if order.order_type == "SL-M" and view.status == "REJECTED" and _slm_blocked(view.message):
-            limit = stop_limit_price(order.trigger_price, order.tick_size)
-            view = self._submit(order, quantity, product, "SL", limit)
+        try:
+            view = self._submit(order, quantity, product, order.order_type, order.price, -1)
+        except BrokerError as exc:
+            recovered = self._recover(order, quantity, product, str(exc))
+            if recovered is None:
+                raise
+            view = recovered
+        if view.status == "REJECTED":
+            recovered = self._recover(order, quantity, product, view.message)
+            if recovered is not None:
+                view = recovered
         return view
 
+    def _recover(self, order: OrderRequest, quantity: int, product: str, message: str):
+        """A refused market or stop-market is sent once in a form Zerodha accepts."""
+        if order.order_type == "SL-M" and _slm_blocked(message):
+            return self._stop_limit(order, quantity, product)
+        if order.order_type == "MARKET" and _protection_required(message):
+            return self._submit(order, quantity, product, "MARKET", order.price, 5)
+        return None
+
+    def _stop_limit(self, order: OrderRequest, quantity: int, product: str) -> OrderView:
+        limit = stop_limit_price(order.trigger_price, order.tick_size)
+        return self._submit(order, quantity, product, "SL", limit, None)
+
     def _submit(self, order: OrderRequest, quantity: int, product: str,
-                order_type: str, price: float) -> OrderView:
+                order_type: str, price: float, protection) -> OrderView:
         side = self.kite.TRANSACTION_TYPE_BUY if order.side == "BUY" else self.kite.TRANSACTION_TYPE_SELL
         kite_product = self.kite.PRODUCT_MIS if product == "MIS" else self.kite.PRODUCT_NRML
         if order_type == "SL-M":
@@ -111,21 +130,28 @@ class ZerodhaBroker:
         validity = self.kite.VALIDITY_IOC if kind == "IOC" else self.kite.VALIDITY_DAY
         send_price = price if kite_type in (self.kite.ORDER_TYPE_LIMIT, self.kite.ORDER_TYPE_SL) else None
         send_trigger = order.trigger_price if kite_type in (self.kite.ORDER_TYPE_SL, self.kite.ORDER_TYPE_SLM) else None
+        # F&O market and stop-market orders are refused unless this is set.
+        # -1 asks Zerodha to apply its own protection band. Limit orders omit it.
+        if kite_type not in (self.kite.ORDER_TYPE_MARKET, self.kite.ORDER_TYPE_SLM):
+            protection = None
         self._pace()
+        params = {
+            "variety": self.kite.VARIETY_REGULAR,
+            "exchange": order.exchange,
+            "tradingsymbol": order.tradingsymbol,
+            "transaction_type": side,
+            "quantity": int(quantity),
+            "product": kite_product,
+            "order_type": kite_type,
+            "price": send_price,
+            "trigger_price": send_trigger,
+            "validity": validity,
+            "tag": order.tag[:20],
+        }
+        if protection is not None:
+            params["market_protection"] = protection
         try:
-            order_id = self.kite.place_order(
-                variety=self.kite.VARIETY_REGULAR,
-                exchange=order.exchange,
-                tradingsymbol=order.tradingsymbol,
-                transaction_type=side,
-                quantity=int(quantity),
-                product=kite_product,
-                order_type=kite_type,
-                price=send_price,
-                trigger_price=send_trigger,
-                validity=validity,
-                tag=order.tag[:20],
-            )
+            order_id = self.kite.place_order(**params)
         except kite_exc.TokenException as exc:
             raise TokenError(str(exc)) from exc
         except kite_exc.InputException as exc:
@@ -182,6 +208,21 @@ class ZerodhaBroker:
         }
         if order_type == self.kite.ORDER_TYPE_SL:
             params["price"] = stop_limit_price(float(trigger_price))
+        else:
+            params["market_protection"] = -1
+        try:
+            self._modify(params)
+        except BrokerError as exc:
+            if order_type != self.kite.ORDER_TYPE_SL and _slm_blocked(str(exc)):
+                params["order_type"] = self.kite.ORDER_TYPE_SL
+                params["price"] = stop_limit_price(float(trigger_price))
+                params.pop("market_protection", None)
+                self._modify(params)
+            else:
+                raise
+        return OrderView(str(order_id), "OPEN", 0.0, 0, "stop modified")
+
+    def _modify(self, params: dict) -> None:
         self._pace()
         try:
             self.kite.modify_order(**params)
@@ -191,7 +232,6 @@ class ZerodhaBroker:
             raise BrokerError(str(exc)) from exc
         except Exception as exc:
             raise TransientError(str(exc)) from exc
-        return OrderView(str(order_id), "OPEN", 0.0, 0, "stop modified")
 
     def cancel(self, order_id: str) -> OrderView:
         self._pace()
@@ -267,18 +307,69 @@ class ZerodhaBroker:
 
 
 def _long_rows(payload: dict, exchange: str, symbol: str) -> list:
+    """Long rows for this contract, from the net book and then the day book.
+
+    A fill can show in the day book before the net book, and the same long
+    can be listed in both. Each exchange and product is counted once.
+    """
+    symbol = (symbol or "").upper()
     wanted = (exchange or "").upper()
-    found = []
-    for row in (payload or {}).get("net") or []:
-        if str(row.get("exchange") or "").upper() != wanted:
+    books = []
+    if isinstance(payload, dict):
+        books.extend(payload.get("net") or [])
+        books.extend(payload.get("day") or [])
+    exact = []
+    same_name = []
+    seen = set()
+    for row in books:
+        if not isinstance(row, dict):
             continue
-        if str(row.get("tradingsymbol") or "") != symbol:
+        name = str(row.get("tradingsymbol") or row.get("trading_symbol") or "").strip().upper()
+        if name != symbol:
             continue
-        qty = int(row.get("quantity") or 0)
+        qty = _position_qty(row)
         if qty <= 0:
             continue
-        found.append((str(row.get("product") or "").upper(), qty))
-    return found
+        held = str(row.get("product") or "").strip().upper()
+        venue = str(row.get("exchange") or "").strip().upper()
+        key = (venue, held)
+        if key in seen:
+            continue
+        seen.add(key)
+        item = (held, qty)
+        same_name.append(item)
+        if not wanted or venue == wanted:
+            exact.append(item)
+    return exact or same_name
+
+
+def _position_qty(row: dict) -> int:
+    """Net long. A zero quantity still counts when the buy and sell columns show a long."""
+    qty = None
+    for key in ("quantity", "qty", "net_quantity", "netqty"):
+        raw = row.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            qty = int(float(raw))
+        except (TypeError, ValueError):
+            continue
+        break
+    buy = _as_int(row.get("buy_quantity")) or _as_int(row.get("day_buy_quantity"))
+    sell = _as_int(row.get("sell_quantity")) or _as_int(row.get("day_sell_quantity"))
+    derived = buy - sell
+    if qty is None:
+        return derived
+    if qty > 0:
+        return qty
+    return derived if derived > 0 else qty
+
+
+def _as_int(raw) -> int:
+    try:
+        return int(float(raw or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _pick_long(found: list, product: str) -> tuple:
@@ -308,11 +399,16 @@ def stop_limit_price(trigger: float, tick: float = 0.05) -> float:
     return price
 
 
+def _protection_required(message: str) -> bool:
+    return "market protection" in (message or "").lower()
+
+
 def _slm_blocked(message: str) -> bool:
     text = (message or "").lower()
-    if "sl-m" in text or "stop loss market" in text or "stop-loss market" in text:
-        return "not allowed" in text or "not permitted" in text or "blocked" in text
-    return False
+    names = ("sl-m", "stoploss market", "stop loss market", "stop-loss market")
+    if not any(name in text for name in names):
+        return False
+    return any(word in text for word in ("not allowed", "not permitted", "blocked", "discontinued"))
 
 
 def _tag_rank(row: dict) -> tuple:

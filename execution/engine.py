@@ -46,8 +46,13 @@ _STOP_RETRY_SEC = 15
 
 
 def _market_stop_blocked(text: str) -> bool:
-    """Kotak blocked a stop-market. One later try sends a stop-limit."""
-    return "stop loss market order not allowed" in (text or "").lower()
+    """The exchange refused a stop-market. Keep retrying; the broker sends a stop-limit."""
+    low = (text or "").lower()
+    if "stop loss market order not allowed" in low:
+        return True
+    named = "sl-m" in low or "stoploss market" in low or "stop loss market" in low
+    refused = "blocked" in low or "discontinued" in low or "not allowed" in low or "market protection" in low
+    return named and refused
 
 
 @dataclass
