@@ -340,7 +340,7 @@ class CopyEngine:
             return Result(name, "WAITING", detail)
         if leg is None or int(leg["lots_open"]) <= 0:
             if pulled == "filled":
-                return Result(name, "FILLED", "stop already closed this account")
+                return Result(name, "FILLED", "stop already closed this account", notify=False)
             return Result(name, "SKIPPED", "nothing open on this account", notify=False)
         lots = sell_lots(int(leg["lots_open"]), event.lots, event.lots_before)
         per = max(1, int(int(leg["quantity_open"]) / int(leg["lots_open"])))
@@ -609,7 +609,7 @@ class CopyEngine:
         if trigger <= 0:
             pulled = self._pull_stop(account, leg)
             if pulled == "filled":
-                return Result(name, "FILLED", "stop filled while it was being removed")
+                return Result(name, "FILLED", "stop filled while it was being removed", notify=False)
             if pulled == "unknown":
                 return Result(name, "UNKNOWN", "could not confirm the stop removal")
             store.set_leg_stop(account["id"], event.position_id, "", 0, 0, "", "")
@@ -840,7 +840,12 @@ class CopyEngine:
             store.set_leg_stop(account["id"], intent["position_id"], view.order_id, trigger, 0,
                                intent.get("tag") or "", "FILLED")
         self._check_day_loss(account)
-        return Result(name, "FILLED", f"stop filled {lots} lots @ {price:,.2f} · pnl {pnl:,.0f}")
+        self._announce(
+            account,
+            f"🟥 <b>Stop hit</b> · {_esc(self._name(account))} · {_esc(leg['tradingsymbol'])}\n"
+            f"{lots} lots @ {price:,.2f} · pnl {pnl:,.0f}",
+        )
+        return Result(name, "FILLED", f"stop filled {lots} lots @ {price:,.2f} · pnl {pnl:,.0f}", notify=False)
 
     def _check_day_loss(self, account: dict) -> None:
         if account.get("kill_switch"):
@@ -1089,10 +1094,11 @@ class CopyEngine:
             _event_from_position(pos, "SELL", int(leg["lots_open"]), int(leg["lots_open"]), "RECOVERY"),
         )
         if result.notify:
+            emoji, title = _scenario("SELL", result.status, "RECOVERY")
             self._announce(
                 account,
-                f"<b>Copy SELL</b> · {_esc(pos.tradingsymbol)} · recovery\n"
-                f"• {_esc(result.label)} · {result.status} · {_esc(result.detail)}",
+                f"{emoji} <b>{title}</b> · {_esc(pos.tradingsymbol)} · recovery\n"
+                f"{_esc(result.label)}\n{_esc(result.detail)}",
             )
 
     def _recover_book(self, positions: list) -> None:
@@ -1113,10 +1119,10 @@ class CopyEngine:
         shown = [item for item in results if item.notify]
         if not shown:
             return
-        verb = "BUY" if event.action == "BUY" else "SELL"
-        lines = [f"<b>Copy {verb}</b> · {_esc(event.tradingsymbol)} · {event.reason}"]
+        lines = [f"<b>{_esc(event.tradingsymbol)}</b> · {_esc(event.reason)}"]
         for item in shown:
-            lines.append(f"• {_esc(item.label)} · {item.status} · {_esc(item.detail)}")
+            emoji, title = _scenario(event.action, item.status, event.reason)
+            lines.append(f"{emoji} <b>{title}</b> · {_esc(item.label)}\n{_esc(item.detail)}")
         self.notify("\n".join(lines))
 
     def _account_lock(self, account_id: int) -> threading.Lock:
@@ -1142,6 +1148,50 @@ class CopyEngine:
             log.info("paper copy kept off Telegram: %s", text)
             return
         self.notify(text)
+
+
+def _scenario(action: str, status: str, reason: str) -> tuple:
+    """Short title for one account's order, posted to the update group."""
+    reason_up = (reason or "").upper()
+    if action == "BUY":
+        titles = {
+            "FILLED": ("✅", "Trade executed"),
+            "WORKING": ("⏳", "Order working"),
+            "MISSED": ("❌", "Trade missed"),
+            "REJECTED": ("❌", "Order rejected"),
+            "SKIPPED": ("⏭️", "Buy skipped"),
+            "AUTH": ("🔑", "Login required"),
+            "UNKNOWN": ("⚠️", "Order not confirmed"),
+            "ERROR": ("⚠️", "Order error"),
+            "WAITING": ("⏳", "Buy waiting"),
+        }
+    elif action == "SELL":
+        if status == "FILLED" and "SL" in reason_up:
+            return "🟥", "Stop hit"
+        titles = {
+            "FILLED": ("🟩", "Trade exited"),
+            "WORKING": ("⏳", "Exit working"),
+            "REJECTED": ("❌", "Exit rejected"),
+            "SKIPPED": ("⏭️", "Exit skipped"),
+            "AUTH": ("🔑", "Login required"),
+            "UNKNOWN": ("⚠️", "Exit not confirmed"),
+            "WAITING": ("⏳", "Exit waiting"),
+            "ERROR": ("⚠️", "Exit error"),
+            "CANCELLED": ("🔧", "Exit cancelled"),
+        }
+    else:
+        titles = {
+            "WORKING": ("🛡️", "Stop working"),
+            "UPDATED": ("🔧", "Stop moved"),
+            "FILLED": ("🟥", "Stop hit"),
+            "REJECTED": ("⚠️", "Stop rejected"),
+            "CANCELLED": ("🔧", "Stop removed"),
+            "UNKNOWN": ("⚠️", "Stop not confirmed"),
+            "SKIPPED": ("⏭️", "Stop skipped"),
+            "AUTH": ("🔑", "Login required"),
+            "ERROR": ("⚠️", "Stop error"),
+        }
+    return titles.get(status, ("ℹ️", status.title()))
 
 
 def _intent_row(key, account, event: CopyEvent, action, lots, quantity, limit_price, order_type, reason) -> dict:

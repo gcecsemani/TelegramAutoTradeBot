@@ -397,7 +397,7 @@ class FanoutTests(unittest.TestCase):
         self.assertEqual(mcx.order_type, "LIMIT")
         self.assertEqual(mcx.validity, "DAY")
         posted = "\n".join(self.notes)
-        self.assertIn("Copy BUY", posted)
+        self.assertIn("Trade executed", posted)
         self.assertNotIn("· paper", posted)
 
     def test_an_exit_cancels_a_resting_limit_instead_of_selling_short(self):

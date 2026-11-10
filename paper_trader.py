@@ -926,13 +926,15 @@ class PaperTrader:
     # ══════════════════════════════════════════════════════════════════════════
 
     def _notify_opened(self, pos: Position, reply_to: Optional[str] = None) -> None:
-        line = (f"✅ <b>BOUGHT {esc(pos.label)}</b> · {pos.entry_price:,.2f} × "
-                f"{_lots(pos.lots)} ({pos.lots * pos.multiplier} qty) · SL {esc(pos.sl_text())}")
+        lines = [
+            f"✅ <b>BOUGHT {esc(pos.label)}</b>",
+            f"{pos.entry_price:,.2f} × {_lots(pos.lots)} ({pos.lots * pos.multiplier} qty) · SL {esc(pos.sl_text())}",
+        ]
         if pos.book_level > 0:
-            line += f" · {esc(self._book_line(pos))}"
+            lines.append(esc(self._book_line(pos)))
         if pos.sl_note:
-            line += f" · {esc(pos.sl_note)}"
-        self.notify(line, reply_to or pos.signal_ref, pos.id)
+            lines.append(esc(pos.sl_note))
+        self.notify("\n".join(lines), reply_to or pos.signal_ref, pos.id)
 
     def _book_line(self, pos: Position) -> str:
         share = "all" if pos.book_pct >= 100 else f"{pos.book_pct:g}%"
@@ -950,8 +952,9 @@ class PaperTrader:
             else:
                 when = f"the premium is at or under {cap:,.2f}"
         lines = [
-            f"⏳ <b>WAITING</b> · {esc(pos.label)} · {esc(pos.entry_text())} · "
-            f"buys when {when} · LTP {quote.ltp:,.2f} · SL {esc(pos.sl_text())}",
+            f"⏳ <b>WAITING</b> · {esc(pos.label)}",
+            f"{esc(pos.entry_text())} · buys when {when}",
+            f"LTP {quote.ltp:,.2f} · SL {esc(pos.sl_text())}",
         ]
         if pos.book_level > 0:
             lines.append(self._book_line(pos))

@@ -63,9 +63,8 @@ class SignalBot:
         self.tg.send(text, reply_to, on_sent)
 
     def _book_notify(self, text: str, reply_to: Optional[str] = None, position_id: Optional[str] = None) -> None:
-        """Paper-book fills stay off Telegram. Commands and live copies still post."""
-        if not config.NOTIFY.get("paper_book"):
-            return
+        """Signal decisions (waiting, bought, exited, refused) post here.
+        Live account orders are posted separately by the copy engine."""
         self.notify(text, reply_to, position_id)
 
     # ─── Lifecycle ────────────────────────────────────────────────────────────
